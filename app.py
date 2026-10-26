@@ -383,30 +383,116 @@ def detect_roh(gt, snp_json, min_snps=15, min_kb=1000.0):
     return (pd.DataFrame(rohs) if rohs else pd.DataFrame(columns=["IID_idx","CHR","start_bp","end_bp","n_snp","length_kb"])), fr
 
 # ============================================================
-# VEP & ANNOTATION (Corrigé avec Debug)
+# FONCTIONS D'ANNOTATION LOCALE (GFF3)
 # ============================================================
-def run_vep_api(snp_list, species="camelus_dromedarius", batch=200):
-    if not snp_list: return pd.DataFrame()
-    url = f"https://rest.ensembl.org/vep/{species}/region?regulatory=1"
-    headers = {"Content-Type":"application/json","Accept":"application/json"}
-    results = []
-    for i in range(0, len(snp_list), batch):
-        chunk = snp_list[i:i+batch]
-        try:
-            r = requests.post(url, headers=headers, data=json.dumps({"variants":chunk}), timeout=60)
-            if r.status_code == 200:
-                for item in r.json():
-                    sid = item.get("input", "N/A")
-                    if item.get("transcript_consequences"):
-                        cons = sorted(item["transcript_consequences"], key=lambda x: {"HIGH":4,"MODERATE":3,"LOW":2,"MODIFIER":1}.get(x.get("impact","MODIFIER"),0), reverse=True)[0]
-                        results.append({"SNP": sid, "GENE": cons.get("gene_symbol","N/A"), "CONSEQUENCE": ", ".join(cons.get("consequence_terms",["N/A"])), "IMPACT": cons.get("impact","N/A")})
-                    else:
-                        results.append({"SNP": sid, "GENE": "Intergenic", "CONSEQUENCE": "N/A", "IMPACT": "MODIFIER"})
+def parse_gff3(b):
+    genes=[]
+    for line in _rt(b).splitlines():
+        if line.startswith("#") or not line.strip(): continue
+        p=line.split("\t")
+        if len(p)>=9 and p[2] == "gene":
+            a=p[8]; name="Unknown"
+            if "Name=" in a: name=a.split("Name=")[1].split(";")[0]
+            elif 'gene_name "' in a: name=a.split('gene_name "')[1].split('"')[0]
+            elif 'gene_id "' in a: name=a.split('gene_id "')[1].split('"')[0]
+            genes.append({"CHR":str(p[0]),"START":int(p[3]),"END":int(p[4]),"GENE":name})
+    return pd.DataFrame(genes).drop_duplicates(subset=["CHR","START","END","GENE"])
+
+def annotate_genes_local(snp_df, gff, window_kb=50):
+    w = window_kb * 1000
+    res = []
+    for _, s in snp_df.iterrows():
+        pos = int(s["BP"]); ch = str(s["CHR"]).replace("chr","")
+        # On cherche les gènes à +/- 50kb
+        msk = (gff["CHR"].astype(str).str.replace("chr","") == ch) & (gff["START"] <= pos + w) & (gff["END"] >= pos - w)
+        ng = gff[msk]
+        if not ng.empty:
+            for _, g in ng.iterrows():
+                res.append({
+                    "SNP": s["SNP"], 
+                    "CHR": ch, 
+                    "BP": pos, 
+                    "GENE": g["GENE"], 
+                    "GENE_START": g["START"], 
+                    "GENE_END": g["END"], 
+                    "DISTANCE_KB": round(abs(g["START"] - pos) / 1000.0, 2)
+                })
+    return pd.DataFrame(res)
+
+
+# ... (GARDEZ TOUT LE RESTE DU CODE COMME AVANT, ET REMPLACEZ JUSTE L'ONGLET VEP) ...
+
+    # ═══════ ONGLET VEP (MIS À JOUR) ═══════
+    with tabs[7]:
+        st.subheader("🧬 Annotation des gènes candidats")
+        
+        annotation_method = st.radio("Méthode d'annotation :", 
+                                     ["🌐 Via l'API Ensembl (Internet)", "💻 En local avec fichier GFF3 (Recommandé)"], 
+                                     horizontal=True)
+
+        snps_vep = []
+        c1, c2, c3 = st.columns(3)
+        
+        # Boutons pour charger les SNPs selon l'analyse
+        if st.session_state.win_fst is not None and c1.button("📥 Top 10 FST", key="load_vep_fst"):
+            top_snps = st.session_state.win_fst.sort_values("MEAN_FST", ascending=False).head(10)["TOP_SNP"].tolist()
+            snps_vep = st.session_state.snp_pruned[st.session_state.snp_pruned["SNP"].isin(top_snps)][["SNP","CHR","BP"]].to_dict('records')
+            st.session_state.vep_snps = snps_vep
+            
+        if st.session_state.taj_df is not None and c2.button("📥 Top 10 Tajima", key="load_vep_taj"):
+            top_taj = st.session_state.taj_df.sort_values("TAJIMA_D").head(10)
+            # Tajima donne des régions, on prend un SNP au milieu
+            snps_vep = [{"SNP": f"Region_{r['CHR']}_{r['MID']}", "CHR": str(r['CHR']), "BP": int(r['MID'])} for _, r in top_taj.iterrows()]
+            st.session_state.vep_snps = snps_vep
+            
+        if st.session_state.css_df is not None and c3.button("📥 Top 10 CSS", key="load_vep_css"):
+            top_snps = st.session_state.css_df.head(10)["SNP"].tolist()
+            snps_vep = st.session_state.snp_pruned[st.session_state.snp_pruned["SNP"].isin(top_snps)][["SNP","CHR","BP"]].to_dict('records')
+            st.session_state.vep_snps = snps_vep
+
+        if st.session_state.get("vep_snps"):
+            st.info(f"🧬 {len(st.session_state.vep_snps)} SNPs chargés pour l'annotation.")
+            
+            # --- MÉTHODE 1 : API ENSEMBL ---
+            if annotation_method.startswith("🌐"):
+                st.markdown("L'API Ensembl peut être lente ou indisponible (Erreur 503).")
+                if st.button("🔬 Lancer VEP (Dromadaire)", type="primary"):
+                    # On formate en CHR:POS pour l'API
+                    req_list = [f"{str(s['CHR']).replace('chr','')}:{s['BP']}-{s['BP']}" for s in st.session_state.vep_snps]
+                    with st.spinner("Interrogation Ensembl..."):
+                        res = run_vep_api(req_list)
+                        if not res.empty:
+                            st.session_state.vep_res = res
+                            st.success("✅ Résultats obtenus.")
+            
+            # --- MÉTHODE 2 : GFF3 LOCAL ---
             else:
-                st.error(f"Erreur API Ensembl (Code {r.status_code}) : {r.text}")
-        except Exception as e: st.warning(f"⚠️ VEP réseau: {e}")
-        time.sleep(1.0)
-    return pd.DataFrame(results)
+                st.markdown("Téléchargez le GFF3 du dromadaire sur Ensembl, puis chargez-le ici.")
+                gff_file = st.file_uploader("Fichier GFF3 (Camelus dromedarius)", type=["gff3", "gff", "gz"])
+                window = st.slider("Fenêtre de recherche autour du SNP (kb)", 1, 500, 50)
+                
+                if gff_file and st.button("💻 Annoter localement", type="primary"):
+                    with st.spinner("Lecture du GFF3 et recherche des gènes..."):
+                        try:
+                            gff_df = parse_gff3(gff_file.read())
+                            st.success(f"✅ GFF3 chargé : {len(gff_df)} gènes trouvés.")
+                            
+                            # On crée un mini dataframe pour l'annotation
+                            df_snps_to_ann = pd.DataFrame(st.session_state.vep_snps)
+                            res_local = annotate_genes_local(df_snps_to_ann, gff_df, window_kb=window)
+                            
+                            if not res_local.empty:
+                                st.session_state.vep_res = res_local
+                                st.success(f"✅ {len(res_local)} associations SNP-Gène trouvées !")
+                            else:
+                                st.warning("⚠️ Aucun gène trouvé à proximité de ces SNPs avec cette fenêtre.")
+                        except Exception as e:
+                            st.error(f"❌ Erreur de lecture du GFF3 : {e}")
+
+            # --- AFFICHAGE DES RÉSULTATS ---
+            if st.session_state.vep_res is not None and not st.session_state.vep_res.empty:
+                st.dataframe(st.session_state.vep_res, use_container_width=True)
+                st.download_button("⬇ Télécharger les résultats (CSV)", st.session_state.vep_res.to_csv(index=False).encode(), "annotation_genes.csv")
 
 # ============================================================
 # VISUALISATIONS
