@@ -1,0 +1,9 @@
+streamlit
+numpy
+pandas
+scipy
+scikit-learn
+plotly
+requests
+biopython
+statsmodels
