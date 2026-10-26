@@ -1,4 +1,4 @@
-"""🐪 Camel Genomics Pipeline v20.0 — Toutes les analyses génomiques fonctionnelles"""
+"""🐪 Camel Genomics Pipeline v20.1 — Toutes les analyses génomiques fonctionnelles (Corrigé)"""
 import gzip, io, os, warnings, time, json, hashlib
 from collections import Counter
 from urllib.parse import quote
@@ -10,7 +10,8 @@ import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
 from scipy.stats import t as t_dist
-from scipy.cluster.hierarchy import linkage, dendrogram, squareform
+from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.spatial.distance import squareform  # <-- CORRECTION ICI
 from sklearn.decomposition import NMF, PCA
 from sklearn.ensemble import RandomForestRegressor
 import requests
@@ -22,7 +23,7 @@ except ImportError: HAS_STATSMODELS = False
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🐪 Camel Genomics v20.0", page_icon="🐪", layout="wide")
+st.set_page_config(page_title="🐪 Camel Genomics v20.1", page_icon="🐪", layout="wide")
 
 # ============================================================
 # CONSTANTES GÉNOMIQUES — Camelus dromedarius (2n=74)
@@ -299,7 +300,7 @@ def fetch_alphafold(gene_name):
 # INTERFACE STREAMLIT
 # ============================================================
 def main():
-    st.title("🐪 Camel Genomics Pipeline v20.0")
+    st.title("🐪 Camel Genomics Pipeline v20.1")
     st.caption("Toutes les analyses du manuscrit + GWAS, FST, ROH, VEP, 3D.")
 
     if "gt" not in st.session_state: st.session_state.gt = None
@@ -436,7 +437,6 @@ def main():
         st.subheader("Arbre Phylogénétique (Neighbor-Joining)")
         if st.button("Construire l'arbre (Reynolds)"):
             D, pops = reynolds_matrix(gt, labels, global_hash)
-            # Création du dendrogramme
             Z = linkage(squareform(D), method='average')
             dn = dendrogram(Z, labels=pops, no_plot=True)
             
@@ -444,7 +444,6 @@ def main():
             for i, d in enumerate(dn['dcoord']):
                 fig.add_trace(go.Scatter(x=d[1], y=d[0], mode='lines', line=dict(color='black', width=2), showlegend=False))
             
-            # Annotation des feuilles
             for i, (leaf_x, leaf_label) in enumerate(zip(dn['leaves'], dn['ivl'])):
                 fig.add_annotation(x=0, y=i*10+5, text=leaf_label, showarrow=False, xanchor='right', xshift=-10)
                 
