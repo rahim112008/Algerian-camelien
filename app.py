@@ -1,4 +1,4 @@
-"""🐪 Camel Genomics Pipeline v20.4 — Ultra-Optimisé (Anti-Timeout & Anti-Crash)"""
+"""🐪 Camel Genomics Pipeline v20.5 — Correction de l'erreur Read-Only (Ne)"""
 import gzip, io, os, warnings, time, json, hashlib, gc
 from collections import Counter
 from urllib.parse import quote
@@ -23,7 +23,7 @@ except ImportError: HAS_STATSMODELS = False
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="🐪 Camel Genomics v20.4", page_icon="🐪", layout="wide")
+st.set_page_config(page_title="🐪 Camel Genomics v20.5", page_icon="🐪", layout="wide")
 
 # ============================================================
 # CONSTANTES
@@ -111,7 +111,7 @@ def parse_ped(b, n_map):
     return gt, pd.DataFrame({"FID": fids, "IID": iids})
 
 # ============================================================
-# ALGORITHMES OPTIMISÉS
+# ALGORITHMES
 # ============================================================
 @st.cache_data(show_spinner=False)
 def apply_qc(_gt, _ind_df, _snp_df, hash_key, geno, mind, maf_t, keep_autosomes):
@@ -138,7 +138,6 @@ def ld_decay(_gt, _snp_df, hash_key, max_kb=7500, max_snp=2000):
     n = _gt.shape[1]
     if n < 10: return pd.DataFrame()
     
-    # Échantillonnage pour économiser la mémoire
     if n > max_snp:
         rng = np.random.default_rng(42)
         idx = np.sort(rng.choice(n, max_snp, replace=False))
@@ -152,13 +151,11 @@ def ld_decay(_gt, _snp_df, hash_key, max_kb=7500, max_snp=2000):
     bp = _snp_df["BP"].values; chrs = _snp_df["CHR"].astype(str).values
     max_bp = max_kb * 1000
     
-    # Vectorisation mathématique (Rapide)
     for i in range(n):
-        j_end = min(i+100, n) # Réduit pour éviter le timeout
+        j_end = min(i+100, n)
         dists = np.abs(bp[i] - bp[i+1:j_end])
         valid = (chrs[i] == chrs[i+1:j_end]) & (dists <= max_bp)
         if np.any(valid):
-            # Calcul du r2 via le produit scalaire
             r = np.dot(X[:, i], X[:, i+1:j_end][:, valid]) / X.shape[0]
             distances.extend(dists[valid] / 1000.0)
             r2_vals.extend(r**2)
@@ -174,12 +171,21 @@ def ld_decay(_gt, _snp_df, hash_key, max_kb=7500, max_snp=2000):
 def ne_snep(_gt, _snp_df, hash_key):
     ld = ld_decay(_gt, _snp_df, hash_key)
     if ld.empty: return pd.DataFrame()
-    c = ld["dist_kb"].values / 100 
-    r2 = ld["r2"].values; r2[r2 < 0.01] = 0.01
+    
+    c = ld["dist_kb"].values.copy() / 100.0 
+    r2 = ld["r2"].values.copy()
+    
+    # Correction : utilisation de np.where au lieu de modifier la vue en place
+    r2 = np.where(r2 < 0.01, 0.01, r2)
+    r2 = np.where(r2 > 1.0, 1.0, r2)
+    
     ne = 1.0 / (4 * c * r2)
     generations = 1.0 / (2 * c)
+    
     df = pd.DataFrame({"Generations": generations, "Ne": ne}).dropna()
-    return df[df["Ne"] > 0].sort_values("Generations")
+    res = df[df["Ne"] > 0].sort_values("Generations")
+    gc.collect()
+    return res
 
 @st.cache_data(show_spinner=False)
 def compute_admixture(_gt, hash_key, K=3):
@@ -320,8 +326,8 @@ def fetch_alphafold(gene_name):
 # INTERFACE
 # ============================================================
 def main():
-    st.title("🐪 Camel Genomics Pipeline v20.4")
-    st.caption("Optimisation mémoire et vitesse. Plus de plantage (GC & Scattergl).")
+    st.title("🐪 Camel Genomics Pipeline v20.5")
+    st.caption("Optimisation mémoire, vitesse et correction de bug Ne.")
 
     if "gt" not in st.session_state: st.session_state.gt = None
 
@@ -435,11 +441,15 @@ def main():
     with tabs[2]:
         st.subheader("Taille Efficace de la Population (Ne)")
         if st.button("Estimer Ne"):
-            ne_df = ne_snep(gt, snp, global_hash)
-            if not ne_df.empty:
-                fig = px.line(ne_df, x="Generations", y="Ne", title="Ne à travers le temps")
-                st.plotly_chart(fig, width='stretch')
-            else: st.warning("Impossible d'estimer Ne.")
+            try:
+                with st.spinner("Calcul de Ne..."):
+                    ne_df = ne_snep(gt, snp, global_hash)
+                if not ne_df.empty:
+                    fig = px.line(ne_df, x="Generations", y="Ne", title="Ne à travers le temps")
+                    st.plotly_chart(fig, width='stretch')
+                else: st.warning("Impossible d'estimer Ne.")
+            except Exception as e:
+                st.error(f"Erreur lors de l'estimation de Ne : {e}")
 
     with tabs[3]:
         st.subheader("Admixture (NMF)")
@@ -481,7 +491,6 @@ def main():
             df_fst = df_fst.dropna(subset=["FST"])
             if not df_fst.empty:
                 df_fst = df_fst.assign(_k=df_fst["CHR"].map(_chk)).sort_values(["_k", "BP"]).reset_index(drop=True)
-                # Scattergl utilise le GPU du navigateur pour éviter de saturer le serveur
                 fig = go.Figure(go.Scattergl(x=df_fst.index, y=df_fst["FST"], mode='markers', 
                                              marker=dict(size=5, color=df_fst["CHR"].astype('category').cat.codes, colorscale='Viridis')))
                 fig.update_layout(title="FST par SNP (Sélection)", xaxis_title="Position génomique", yaxis_title="FST")
