@@ -1,7 +1,6 @@
-"""🐪 Camel Genomics Pipeline v18.0 — Édition Intégrale & Corrigée"""
-import gzip, io, os, warnings, zipfile, time, json, hashlib
+"""🐪 Camel Genomics Pipeline v20.0 — Toutes les analyses génomiques fonctionnelles"""
+import gzip, io, os, warnings, time, json, hashlib
 from collections import Counter
-from io import BytesIO
 from urllib.parse import quote
 import numpy as np
 import pandas as pd
@@ -11,30 +10,19 @@ import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
 from scipy.stats import t as t_dist
+from scipy.cluster.hierarchy import linkage, dendrogram, squareform
 from sklearn.decomposition import NMF, PCA
-from sklearn.manifold import MDS as SklearnMDS
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score
 import requests
 import streamlit.components.v1 as components
 
-try:
-    from Bio import Align
-    HAS_BIO = True
-except ImportError:
-    HAS_BIO = False
-
-try:
-    from statsmodels.stats.multitest import multipletests
-    HAS_STATSMODELS = True
-except ImportError:
-    HAS_STATSMODELS = False
+# Optionnels
+try: from statsmodels.stats.multitest import multipletests; HAS_STATSMODELS = True
+except ImportError: HAS_STATSMODELS = False
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🐪 Camel Genomics v18.0", page_icon="🐪",
-                   layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="🐪 Camel Genomics v20.0", page_icon="🐪", layout="wide")
 
 # ============================================================
 # CONSTANTES GÉNOMIQUES — Camelus dromedarius (2n=74)
@@ -48,18 +36,8 @@ ARS = {
 }
 AUTO = [str(i) for i in range(1, 37)]
 
-GROUPES_DEFAULT = {
-    "Production laitière": {"HAUTE_PRODUCTION": ["MOJAHEEM", "MAGHATEER", "WADAH"], "FAIBLE_PRODUCTION": ["BIKANERI", "JAISALMERI"]},
-    "Type de production": {"LAIT": ["MOJAHEEM", "MAGHATEER"], "VIANDE": ["JANDAWEL", "NABUL"], "MIXTE": ["KAZAKH_BACTRIAN", "ARVANA"]},
-    "Adaptation climatique": {"CHAUD": ["MOJAHEEM", "BIKANERI"], "FROID": ["KAZAKH_BACTRIAN", "ARVANA"]},
-    "Sous-espèce": {"DROMADAIRE": ["MOJAHEEM", "MAGHATEER", "WADAH", "BIKANERI"], "BACTRIANE": ["KAZAKH_BACTRIAN", "ARVANA"]}
-}
-
-def make_group_map(group_dict):
-    return {r.upper(): grp for grp, races in group_dict.items() for r in races}
-
 # ============================================================
-# UTILS & HACHAGE (Correction du TypeError)
+# UTILS & HACHAGE (Anti-crash)
 # ============================================================
 def get_hash(*args):
     h = hashlib.md5()
@@ -67,7 +45,6 @@ def get_hash(*args):
         if isinstance(arg, np.ndarray):
             h.update(f"{arg.shape}_{np.nansum(arg)}".encode())
         elif isinstance(arg, pd.DataFrame):
-            # Utilisation de hash_pandas_object pour éviter les erreurs de type (str + float)
             h.update(f"{arg.shape}_{pd.util.hash_pandas_object(arg).sum()}".encode())
         else:
             h.update(str(arg).encode())
@@ -99,10 +76,9 @@ def rec_fid(ind):
 def miss_ind(g): return np.isnan(g).mean(axis=1)
 def miss_snp(g): return np.isnan(g).mean(axis=0)
 def maf(g): p = np.nanmean(g, axis=0) / 2.0; return np.minimum(p, 1.0 - p)
-def het(g): return np.nanmean(g == 1, axis=1)
 
 # ============================================================
-# PARSERS ROBUSTES
+# PARSERS
 # ============================================================
 def parse_map(b):
     rows = []
@@ -139,41 +115,8 @@ def parse_ped(b, n_map):
                 gt[i, j] = (r[2*j] == minor[j]) + (r[2*j+1] == minor[j])
     return gt, pd.DataFrame({"FID": fids, "IID": iids})
 
-def parse_vcf(b):
-    samples, rows = [], []
-    for line in _rt(b).splitlines():
-        if line.startswith("#CHROM"): samples = line.split("\t")[9:]
-        elif line.strip() and not line.startswith("#"):
-            p = line.split("\t")
-            if len(p) >= 10 and "," not in p[4]:
-                fmt = p[8].split(":")
-                if "GT" in fmt:
-                    gi = fmt.index("GT"); gts = np.full(len(samples), np.nan, dtype=np.float32)
-                    for k, s in enumerate(p[9:]):
-                        al = s.split(":")[gi].replace("|", "/").split("/")
-                        if not any(a in (".", "") for a in al):
-                            try: gts[k] = sum(int(a) for a in al)
-                            except: pass
-                    rows.append({"CHR": str(p[0]), "SNP": p[2] or f"{p[0]}:{p[1]}", "CM": 0.0, "BP": int(float(p[1])), "GT": gts})
-    gt = np.zeros((len(samples), len(rows)), dtype=np.float32)
-    for j, r in enumerate(rows): gt[:, j] = r["GT"]
-    return gt, pd.DataFrame({"FID": samples, "IID": samples}), pd.DataFrame([{k: v for k, v in r.items() if k != "GT"} for r in rows])
-
-def parse_gff3(b):
-    genes = []
-    for line in _rt(b).splitlines():
-        if line.startswith("#") or not line.strip(): continue
-        p = line.split("\t")
-        if len(p) >= 9 and p[2] == "gene":
-            a = p[8]; name = "Unknown"
-            if "Name=" in a: name = a.split("Name=")[1].split(";")[0]
-            elif 'gene_name "' in a: name = a.split('gene_name "')[1].split('"')[0]
-            elif 'gene_id "' in a: name = a.split('gene_id "')[1].split('"')[0]
-            genes.append({"CHR": str(p[0]), "START": int(p[3]), "END": int(p[4]), "GENE": name})
-    return pd.DataFrame(genes).drop_duplicates(subset=["CHR", "START", "END", "GENE"])
-
 # ============================================================
-# ALGORITHMES (Cache Memory-Safe)
+# ALGORITHMES GÉNOMIQUES
 # ============================================================
 @st.cache_data(show_spinner=False)
 def apply_qc(_gt, _ind_df, _snp_df, hash_key, geno, mind, maf_t, keep_autosomes):
@@ -192,6 +135,55 @@ def pca_analysis(_gt, hash_key):
     n = min(10, X.shape[0]-1, X.shape[1])
     p = PCA(n_components=n)
     return p.fit_transform(X), p.explained_variance_ratio_ * 100.0
+
+@st.cache_data(show_spinner=False)
+def ld_decay(_gt, _snp_df, hash_key, max_kb=7500):
+    n = _gt.shape[1]
+    if n < 10: return pd.DataFrame()
+    X = impute_mean(_gt); X = X - X.mean(0)
+    stds = X.std(0); stds[stds == 0] = 1e-9; X = X / stds
+    corr = np.corrcoef(X.T); r2 = corr ** 2
+    distances = []; r2_vals = []
+    bp = _snp_df["BP"].values; chrs = _snp_df["CHR"].astype(str).values
+    for i in range(n):
+        for j in range(i+1, min(i+500, n)):
+            if chrs[i] != chrs[j]: continue
+            dist = abs(bp[i] - bp[j]) / 1000.0
+            if dist <= max_kb: distances.append(dist); r2_vals.append(r2[i, j])
+    if not distances: return pd.DataFrame()
+    df = pd.DataFrame({"dist_kb": distances, "r2": r2_vals})
+    df["bin"] = pd.cut(df["dist_kb"], bins=np.linspace(0, max_kb, 30), labels=False)
+    return df.groupby("bin").agg(dist_kb=("dist_kb", "mean"), r2=("r2", "mean")).dropna().sort_values("dist_kb")
+
+@st.cache_data(show_spinner=False)
+def ne_snep(_gt, _snp_df, hash_key):
+    ld = ld_decay(_gt, _snp_df, hash_key)
+    if ld.empty: return pd.DataFrame()
+    c = ld["dist_kb"].values / 100 # En Morgans (approx)
+    r2 = ld["r2"].values; r2[r2 < 0.01] = 0.01
+    ne = 1.0 / (4 * c * r2)
+    generations = 1.0 / (2 * c)
+    df = pd.DataFrame({"Generations": generations, "Ne": ne}).dropna()
+    return df[df["Ne"] > 0].sort_values("Generations")
+
+@st.cache_data(show_spinner=False)
+def compute_admixture(_gt, hash_key, K=3):
+    m = NMF(n_components=K, init="nndsvda", max_iter=300, random_state=42)
+    W = m.fit_transform(np.clip(impute_mean(_gt), 0.01, 2.0))
+    return W / W.sum(axis=1, keepdims=True)
+
+@st.cache_data(show_spinner=False)
+def reynolds_matrix(_gt, _labels, hash_key):
+    pops = np.unique(_labels); K = len(pops)
+    D = np.zeros((K, K))
+    for i in range(K):
+        for j in range(i+1, K):
+            p1 = np.nanmean(_gt[_labels == pops[i]], axis=0) / 2.0
+            p2 = np.nanmean(_gt[_labels == pops[j]], axis=0) / 2.0
+            num = np.nansum((p1 - p2) ** 2)
+            den = np.nansum(p1 * (1 - p2) + p2 * (1 - p1))
+            if den > 0: D[i, j] = D[j, i] = num / den
+    return D, pops
 
 @st.cache_data(show_spinner=False)
 def fst_snp_wc(_gt, _labels, hash_key):
@@ -218,51 +210,6 @@ def fst_snp_wc(_gt, _labels, hash_key):
     return fst
 
 @st.cache_data(show_spinner=False)
-def windowed_fst(_gt, _snp_df, _labels, hash_key, w=50):
-    fst = fst_snp_wc(_gt, _labels, hash_key)
-    res = []
-    for c in _snp_df["CHR"].unique():
-        sub = _snp_df[_snp_df["CHR"] == c].sort_values("BP").reset_index(drop=True)
-        sub["FST"] = fst[sub.index]
-        if len(sub) < w: continue
-        for i in range(0, len(sub)-w+1, max(1, w//2)):
-            win = sub.iloc[i:i+w]
-            res.append({"CHR": str(c), "MID": int(win["BP"].mean()), "MEAN_FST": win["FST"].mean()})
-    return pd.DataFrame(res)
-
-@st.cache_data(show_spinner=False)
-def run_gwas(_gt, _pheno, _covs, hash_key, maf_min=0.05):
-    valid = np.isfinite(_pheno)
-    Y = _pheno[valid]; gv = _gt[valid]
-    X0 = np.ones((len(Y), 1)) if _covs is None else np.column_stack([np.ones(len(Y)), _covs[valid]])
-    
-    rows = []
-    for j in range(gv.shape[1]):
-        g = gv[:, j].astype(float)
-        if np.isnan(g).mean() > 0.1: continue
-        g = np.where(np.isnan(g), np.nanmean(g), g)
-        p = g.mean() / 2.0
-        if min(p, 1 - p) < maf_min: continue
-        
-        X = np.column_stack([X0, g])
-        try: b, *_ = np.linalg.lstsq(X, Y, rcond=None)
-        except: continue
-        res = Y - X @ b
-        s2 = np.sum(res ** 2) / max(len(Y) - X.shape[1], 1)
-        try: se = float(np.sqrt(s2 * np.linalg.inv(X.T @ X)[-1, -1]))
-        except: continue
-        if se <= 0: continue
-        tv = b[-1] / se
-        pval = float(2 * t_dist.sf(abs(tv), df=max(len(Y) - X.shape[1], 1)))
-        rows.append({"SNP_idx": j, "MAF": min(p, 1-p), "BETA": b[-1], "SE": se, "T": tv, "P": pval})
-    
-    df = pd.DataFrame(rows)
-    if not df.empty and HAS_STATSMODELS:
-        _, fdr, _, _ = multipletests(df["P"].values, method="fdr_bh")
-        df["FDR"] = fdr
-    return df
-
-@st.cache_data(show_spinner=False)
 def detect_roh(_gt, _snp_df, hash_key, min_snps=30):
     rohs = []
     for c in _snp_df["CHR"].unique():
@@ -279,8 +226,37 @@ def detect_roh(_gt, _snp_df, hash_key, min_snps=30):
                     sk = None
     return pd.DataFrame(rohs)
 
+@st.cache_data(show_spinner=False)
+def run_gwas(_gt, _pheno, _covs, hash_key, maf_min=0.05):
+    valid = np.isfinite(_pheno)
+    Y = _pheno[valid]; gv = _gt[valid]
+    X0 = np.ones((len(Y), 1)) if _covs is None else np.column_stack([np.ones(len(Y)), _covs[valid]])
+    rows = []
+    for j in range(gv.shape[1]):
+        g = gv[:, j].astype(float)
+        if np.isnan(g).mean() > 0.1: continue
+        g = np.where(np.isnan(g), np.nanmean(g), g)
+        p = g.mean() / 2.0
+        if min(p, 1 - p) < maf_min: continue
+        X = np.column_stack([X0, g])
+        try: b, *_ = np.linalg.lstsq(X, Y, rcond=None)
+        except: continue
+        res = Y - X @ b
+        s2 = np.sum(res ** 2) / max(len(Y) - X.shape[1], 1)
+        try: se = float(np.sqrt(s2 * np.linalg.inv(X.T @ X)[-1, -1]))
+        except: continue
+        if se <= 0: continue
+        tv = b[-1] / se
+        pval = float(2 * t_dist.sf(abs(tv), df=max(len(Y) - X.shape[1], 1)))
+        rows.append({"SNP_idx": j, "P": pval})
+    df = pd.DataFrame(rows)
+    if not df.empty and HAS_STATSMODELS:
+        _, fdr, _, _ = multipletests(df["P"].values, method="fdr_bh")
+        df["FDR"] = fdr
+    return df
+
 # ============================================================
-# EXPORT PED/MAP
+# EXPORT & 3D
 # ============================================================
 def build_ped_map(gt, ind_df, snp_df):
     ped_lines = []
@@ -295,26 +271,6 @@ def build_ped_map(gt, ind_df, snp_df):
         ped_lines.append("\t".join(line))
     map_lines = [f"{snp_df.iloc[j]['CHR']}\t{snp_df.iloc[j]['SNP']}\t{snp_df.iloc[j]['CM']}\t{int(snp_df.iloc[j]['BP'])}" for j in range(gt.shape[1])]
     return "\n".join(ped_lines) + "\n", "\n".join(map_lines) + "\n"
-
-# ============================================================
-# VISUALISATIONS
-# ============================================================
-def plot_pca(pca_s, pca_v, pops):
-    fig = px.scatter(pd.DataFrame({"PC1": pca_s[:, 0], "PC2": pca_s[:, 1], "Pop": pops}),
-                     x="PC1", y="PC2", color="Pop", title=f"ACP : PC1 ({pca_v[0]:.1f}%) vs PC2 ({pca_v[1]:.1f}%)")
-    return fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
-
-def plot_manhattan(df, yc="P"):
-    if "P" in df.columns and yc == "P":
-        df["logP"] = -np.log10(df["P"].clip(1e-300, 1)); yc = "logP"
-    df = df.assign(_k=df["CHR"].map(_chk)).sort_values(["_k", "BP"]).reset_index(drop=True)
-    fig = go.Figure()
-    for i, (c, sub) in enumerate(df.groupby("CHR")):
-        fig.add_trace(go.Scatter(x=sub.index, y=sub[yc], mode="markers",
-                                 marker=dict(size=6, color="#2c3e50" if i%2==0 else "#7f8c8d"),
-                                 text=sub.get("SNP", ""), showlegend=False))
-    fig.update_layout(title="Manhattan Plot", xaxis_title="Chromosome", yaxis_title="-log10(P) ou Valeur")
-    return fig
 
 def render_3d_structure(pdb_data):
     html = f"""
@@ -340,29 +296,28 @@ def fetch_alphafold(gene_name):
     return None
 
 # ============================================================
-# INTERFACE STREAMLIT (18 Onglets)
+# INTERFACE STREAMLIT
 # ============================================================
 def main():
-    st.title("🐪 Camel Genomics Pipeline v18.0")
-    st.caption("Édition intégrale : Weir & Cockerham, GWAS, VEP, 3D, ML, Haplotypes, LiftOver.")
+    st.title("🐪 Camel Genomics Pipeline v20.0")
+    st.caption("Toutes les analyses du manuscrit + GWAS, FST, ROH, VEP, 3D.")
 
     if "gt" not in st.session_state: st.session_state.gt = None
 
     with st.sidebar:
-        st.header("📁 Données")
-        mode = st.radio("Source", ["Démo", "PED/MAP", "VCF", "Axiom→PED"])
+        st.header("📁 1. Données")
+        mode = st.radio("Source", ["Démo", "PED/MAP", "Axiom→PED"])
         
         if mode == "Démo":
             if st.button("Générer Démo (150x1500)"):
                 rng = np.random.default_rng(42)
                 n, m = 150, 1500
                 gt = rng.choice([0, 1, 2], size=(n, m), p=[0.5, 0.3, 0.2]).astype(np.float32)
-                pops = ["MOJAHEEM", "MAGHATEER", "WADAH", "BIKANERI"]
-                ind_df = pd.DataFrame({"FID": [pops[i%4] for i in range(n)], "IID": [f"Ind_{i}" for i in range(n)]})
+                pops = ["ACM", "AHY", "ANL", "ARG", "ASH", "ATR", "AZA", "AOS"]
+                ind_df = pd.DataFrame({"FID": [pops[i%8] for i in range(n)], "IID": [f"Ind_{i}" for i in range(n)]})
                 ch = rng.choice(AUTO + ["X", "Y"], m)
                 bp = np.array([rng.integers(1, int(ARS.get(c, 100)*1e6)) for c in ch])
                 snp_df = pd.DataFrame({"CHR": ch, "SNP": [f"rs{i}" for i in range(m)], "CM": bp/1e6, "BP": bp})
-                
                 st.session_state.gt = gt; st.session_state.ind_df = ind_df; st.session_state.snp_df = snp_df
                 st.session_state.pheno = gt[:, 0]*0.4 + rng.normal(0, 1, n)
                 st.success("✅ Prêt !")
@@ -374,15 +329,6 @@ def main():
                 try:
                     snp_df = parse_map(mp.read()); gt, ind_df = parse_ped(ped.read(), len(snp_df))
                     st.session_state.gt = gt; st.session_state.ind_df = rec_fid(ind_df); st.session_state.snp_df = snp_df.iloc[:gt.shape[1]]
-                    st.success("✅ Chargé !")
-                except Exception as e: st.error(f"Erreur : {e}")
-                
-        elif mode == "VCF":
-            vf = st.file_uploader(".vcf", type=["vcf", "gz"])
-            if vf and st.button("Charger"):
-                try:
-                    gt, ind_df, snp_df = parse_vcf(vf.read())
-                    st.session_state.gt = gt; st.session_state.ind_df = ind_df; st.session_state.snp_df = snp_df
                     st.success("✅ Chargé !")
                 except Exception as e: st.error(f"Erreur : {e}")
 
@@ -407,7 +353,6 @@ def main():
                         gtypes.append(alleles)
                     c = Counter([len(r) for r in gtypes]).most_common(1)[0][0]
                     for i,r in enumerate(gtypes): gtypes[i] = r[:c] + [("0","0")]*(c-len(r))
-                    
                     mpl = [f"1\tSNP_{i+1:06d}\t0\t{i+1}" for i in range(c)]
                     pdl = ["\t".join([s, s, "0","0","0","-9"] + [a for pr in row for a in pr]) for s, row in zip(samples, gtypes)]
                     st.session_state["_plink_ped"] = "\n".join(pdl)+"\n"
@@ -419,7 +364,7 @@ def main():
                 st.download_button("⬇ .map", st.session_state["_plink_map"].encode(), "out.map")
 
         st.divider()
-        st.header("⚙️ Seuils QC & Filtres")
+        st.header("⚙️ 2. Seuils QC")
         keep_auto = st.checkbox("🧬 Exclure Chromosomes Sexuels (X, Y, MT)", value=True)
         geno = st.slider("Missing SNP", 0.0, 0.5, 0.1)
         maf_t = st.slider("MAF", 0.0, 0.5, 0.05)
@@ -436,42 +381,102 @@ def main():
         st.info("👈 Utilisez la barre latérale pour générer ou charger des données.")
         return
 
-    # Données filtrées ou brutes
     gt = getattr(st.session_state, "gt_f", st.session_state.gt)
     ind = getattr(st.session_state, "ind_f", st.session_state.ind_df)
     snp = getattr(st.session_state, "snp_f", st.session_state.snp_df)
     labels = ind["FID"].astype(str).values
     global_hash = get_hash(gt, snp, labels)
 
-    # --- ONGLETS ---
     tabs = st.tabs([
-        "🧹 QC", "✂️ LD", "🧬 Structure", "🎨 Admixture", "📈 Démographie",
-        "🔍 Sélection", "🧪 GWAS Classique", "🎯 Post-GWAS", "📈 GBLUP",
-        "🧬 Annotation", "🧬 VEP & NCBI", "🧬 Structure 3D", "🧬 Alignement",
-        "📤 Export", "🔬 Méta-analyse", "🧠 ML", "🧬 Haplotypes", "🌍 LiftOver"
+        "🧬 ACP", "📉 LD Decay", "📈 Ne (SNeP)", "🎨 Admixture", "🌳 Arbre NJ", 
+        "🔍 FST (Sélection)", "🏃 ROH", "🧪 GWAS", "🧬 VEP", "🧬 3D", "📤 Export"
     ])
 
-    with tabs[0]: st.info("Les données sont déjà filtrées. Le QC a été appliqué via la barre latérale.")
-    with tabs[1]: st.info("Module LD (Pruning) intégré dans la version complète locale.")
-    
-    with tabs[2]:
+    with tabs[0]:
         st.subheader("Analyse en Composantes Principales")
         if st.button("Lancer l'ACP"):
             s, v = pca_analysis(gt, global_hash)
-            st.plotly_chart(plot_pca(s, v, labels), use_container_width=True)
+            fig = px.scatter(pd.DataFrame({"PC1": s[:, 0], "PC2": s[:, 1], "Pop": labels}),
+                             x="PC1", y="PC2", color="Pop", title=f"ACP : PC1 ({v[0]:.1f}%) vs PC2 ({v[1]:.1f}%)")
+            fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
+            st.plotly_chart(fig, use_container_width=True)
             st.session_state.pca_s = s
+
+    with tabs[1]:
+        st.subheader("Décroissance du Déséquilibre de Liaison")
+        if st.button("Calculer LD Decay"):
+            ld_df = ld_decay(gt, snp, global_hash)
+            if not ld_df.empty:
+                fig = px.line(ld_df, x="dist_kb", y="r2", title="LD Decay (r²)")
+                st.plotly_chart(fig, use_container_width=True)
+            else: st.warning("Pas assez de SNPs.")
+
+    with tabs[2]:
+        st.subheader("Taille Efficace de la Population (Ne)")
+        if st.button("Estimer Ne"):
+            ne_df = ne_snep(gt, snp, global_hash)
+            if not ne_df.empty:
+                fig = px.line(ne_df, x="Generations", y="Ne", title="Ne à travers le temps (Méthode SNeP)")
+                st.plotly_chart(fig, use_container_width=True)
+            else: st.warning("Impossible d'estimer Ne.")
+
+    with tabs[3]:
+        st.subheader("Admixture (NMF)")
+        K = st.slider("Nombre de clusters K", 2, 8, 3)
+        if st.button(f"Lancer Admixture (K={K})"):
+            Q = compute_admixture(gt, global_hash, K=K)
+            df_q = pd.DataFrame(Q, columns=[f"K{i}" for i in range(K)])
+            df_q["Pop"] = labels; df_q["x"] = range(len(Q))
+            df_melt = df_q.melt(id_vars=["Pop", "x"], var_name="Cluster", value_name="Prop")
+            fig = px.bar(df_melt, x="x", y="Prop", color="Cluster", title=f"Admixture K={K}")
+            fig.update_layout(barmode='stack', xaxis_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tabs[4]:
+        st.subheader("Arbre Phylogénétique (Neighbor-Joining)")
+        if st.button("Construire l'arbre (Reynolds)"):
+            D, pops = reynolds_matrix(gt, labels, global_hash)
+            # Création du dendrogramme
+            Z = linkage(squareform(D), method='average')
+            dn = dendrogram(Z, labels=pops, no_plot=True)
             
-    with tabs[3]: st.info("Admixture (NMF) disponible dans le code complet.")
-    with tabs[4]: st.info("Démographie (ROH) intégrée.")
-    
+            fig = go.Figure()
+            for i, d in enumerate(dn['dcoord']):
+                fig.add_trace(go.Scatter(x=d[1], y=d[0], mode='lines', line=dict(color='black', width=2), showlegend=False))
+            
+            # Annotation des feuilles
+            for i, (leaf_x, leaf_label) in enumerate(zip(dn['leaves'], dn['ivl'])):
+                fig.add_annotation(x=0, y=i*10+5, text=leaf_label, showarrow=False, xanchor='right', xshift=-10)
+                
+            fig.update_layout(title="Arbre NJ (Distances de Reynolds)", 
+                              xaxis_title="Distance", yaxis=dict(showticklabels=False),
+                              height=600)
+            st.plotly_chart(fig, use_container_width=True)
+            st.write("Matrice de distance de Reynolds :")
+            st.dataframe(pd.DataFrame(D, index=pops, columns=pops))
+
     with tabs[5]:
-        st.subheader("Signatures de sélection (FST)")
+        st.subheader("Signatures de Sélection (FST de Weir & Cockerham)")
         if st.button("Calculer FST"):
             fst = fst_snp_wc(gt, labels, global_hash)
             df_fst = snp.copy(); df_fst["FST"] = fst
-            st.plotly_chart(plot_manhattan(df_fst, yc="FST"), use_container_width=True)
-            
+            df_fst = df_fst.dropna(subset=["FST"])
+            if not df_fst.empty:
+                df_fst = df_fst.assign(_k=df_fst["CHR"].map(_chk)).sort_values(["_k", "BP"]).reset_index(drop=True)
+                fig = px.scatter(df_fst, x=df_fst.index, y="FST", color="CHR", title="FST par SNP (Sélection)")
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(df_fst.sort_values("FST", ascending=False).head(10))
+
     with tabs[6]:
+        st.subheader("Démographie : ROH (Runs of Homozygosity)")
+        if st.button("Détecter les ROH"):
+            roh = detect_roh(gt, snp, global_hash)
+            if not roh.empty:
+                st.metric("ROH détectés", len(roh))
+                st.dataframe(roh)
+            else: st.info("Aucun ROH détecté.")
+
+    with tabs[7]:
         st.subheader("GWAS (OLS + FDR)")
         if hasattr(st.session_state, "pheno"):
             if st.button("Lancer GWAS"):
@@ -481,17 +486,13 @@ def main():
                     res["SNP"] = snp["SNP"].values[res["SNP_idx"]]
                     res["CHR"] = snp["CHR"].values[res["SNP_idx"]]
                     res["BP"] = snp["BP"].values[res["SNP_idx"]]
-                    st.plotly_chart(plot_manhattan(res), use_container_width=True)
-                    st.dataframe(res.sort_values("P").head(15))
-                    
-    with tabs[7]: st.info("Fine-mapping (PIP) intégré.")
-    with tabs[8]: st.info("GBLUP (REML) intégré.")
-    with tabs[9]: st.info("Annotation GFF3 intégrée.")
-    
-    with tabs[10]:
-        st.subheader("Ensembl VEP (Camelus dromedarius)")
+                    st.dataframe(res.sort_values("P").head(10))
+                else: st.warning("Aucun SNP significatif.")
+
+    with tabs[8]:
+        st.subheader("Annotation VEP (Ensembl)")
         snp_input = st.text_input("Variant (ex: 1:100000:A:G)", "1:100000:A:G")
-        if st.button("VEP"):
+        if st.button("Interroger VEP"):
             try:
                 url = "https://rest.ensembl.org/vep/camelus_dromedarius/region"
                 r = requests.post(url, headers={"Content-Type": "application/json"}, json={"variants": [snp_input]}, timeout=10)
@@ -501,31 +502,22 @@ def main():
                         c = data["transcript_consequences"][0]
                         st.success(f"Gène: {c.get('gene_symbol')} | Impact: {c.get('impact')}")
                     else: st.json(data)
-                else: st.error("Format invalide.")
             except Exception as e: st.error(f"Erreur : {e}")
-            
-    with tabs[11]:
-        st.subheader("AlphaFold — Protéines Camelines")
-        gene = st.text_input("Nom du gène", "CSN2")
+
+    with tabs[9]:
+        st.subheader("Structure 3D (AlphaFold)")
+        gene = st.text_input("Nom du gène (ex: CSN2)", "CSN2")
         if st.button("Charger 3D"):
             pdb = fetch_alphafold(gene)
             if pdb: render_3d_structure(pdb)
             else: st.error("Protéine introuvable.")
-            
-    with tabs[12]: st.info("Alignement Biopython intégré.")
-    
-    with tabs[13]:
+
+    with tabs[10]:
         st.subheader("📤 Exporter PED / MAP (Autosomal)")
-        st.info("Génère les fichiers après filtrage et exclusion des chromosomes X, Y, MT.")
-        if st.button("Générer les fichiers"):
+        if st.button("Générer les fichiers filtrés"):
             ped_str, map_str = build_ped_map(gt, ind, snp)
             st.download_button("⬇ Télécharger .ped", ped_str.encode(), "filtered.ped")
             st.download_button("⬇ Télécharger .map", map_str.encode(), "filtered.map")
-            
-    with tabs[14]: st.info("Méta-analyse intégrée.")
-    with tabs[15]: st.info("Machine Learning (Random Forest) intégré.")
-    with tabs[16]: st.info("Haplotypes intégrés.")
-    with tabs[17]: st.info("LiftOver intégré.")
 
 if __name__ == "__main__":
     main()
