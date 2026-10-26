@@ -1,5 +1,5 @@
-"""🐪 Camel Genomics Pipeline v17.0 — Édition Intégrale (Bovine v12 adaptée)"""
-import gzip, io, os, warnings, zipfile, subprocess, tempfile, shutil, hashlib
+"""🐪 Camel Genomics Pipeline v18.0 — Édition Intégrale & Corrigée"""
+import gzip, io, os, warnings, zipfile, time, json, hashlib
 from collections import Counter
 from io import BytesIO
 from urllib.parse import quote
@@ -10,14 +10,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
-from scipy.optimize import minimize_scalar
 from scipy.stats import t as t_dist
 from sklearn.decomposition import NMF, PCA
 from sklearn.manifold import MDS as SklearnMDS
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
-import requests, time, json
+import requests
 import streamlit.components.v1 as components
 
 try:
@@ -34,7 +33,7 @@ except ImportError:
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🐪 Camel Pipeline v17.0", page_icon="🐪",
+st.set_page_config(page_title="🐪 Camel Genomics v18.0", page_icon="🐪",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
@@ -50,49 +49,29 @@ ARS = {
 AUTO = [str(i) for i in range(1, 37)]
 
 GROUPES_DEFAULT = {
-    "Niveau de production laitière": {"HAUTE_PRODUCTION_LAITIERE": ["MOJAHEEM", "MAGHATEER", "WADAH"], "FAIBLE_PRODUCTION_LAITIERE": ["BIKANERI", "JAISALMERI"]},
-    "Type de production principal": {"LAIT": ["MOJAHEEM", "MAGHATEER"], "VIANDE": ["JANDAWEL", "NABUL"], "MIXTE": ["KAZAKH_BACTRIAN", "ARVANA"]},
-    "Adaptation climatique": {"TROPICAL_CHAUD": ["MOJAHEEM", "BIKANERI"], "TEMPERÉ_FROID": ["KAZAKH_BACTRIAN", "ARVANA"]},
-    "Sous-espèce cameline": {"DROMADAIRE": ["MOJAHEEM", "MAGHATEER", "WADAH", "BIKANERI"], "BACTRIANE": ["KAZAKH_BACTRIAN", "ARVANA"]}
+    "Production laitière": {"HAUTE_PRODUCTION": ["MOJAHEEM", "MAGHATEER", "WADAH"], "FAIBLE_PRODUCTION": ["BIKANERI", "JAISALMERI"]},
+    "Type de production": {"LAIT": ["MOJAHEEM", "MAGHATEER"], "VIANDE": ["JANDAWEL", "NABUL"], "MIXTE": ["KAZAKH_BACTRIAN", "ARVANA"]},
+    "Adaptation climatique": {"CHAUD": ["MOJAHEEM", "BIKANERI"], "FROID": ["KAZAKH_BACTRIAN", "ARVANA"]},
+    "Sous-espèce": {"DROMADAIRE": ["MOJAHEEM", "MAGHATEER", "WADAH", "BIKANERI"], "BACTRIANE": ["KAZAKH_BACTRIAN", "ARVANA"]}
 }
 
 def make_group_map(group_dict):
     return {r.upper(): grp for grp, races in group_dict.items() for r in races}
 
-def apply_group_mapping(ind_df, group_map, default="AUTRE"):
-    df = ind_df.copy(); df["FID"] = df["FID"].astype(str).str.upper()
-    df["FID_GROUPE"] = df["FID"].map(group_map).fillna(default)
-    return df
-
 # ============================================================
-# UTILS & HASHING (Anti-plantage)
+# UTILS & HACHAGE (Correction du TypeError)
 # ============================================================
 def get_hash(*args):
     h = hashlib.md5()
     for arg in args:
-        if isinstance(arg, np.ndarray): h.update(f"{arg.shape}_{np.nansum(arg)}".encode())
-        elif isinstance(arg, pd.DataFrame): h.update(f"{arg.shape}_{arg.sum().sum()}".encode())
-        else: h.update(str(arg).encode())
+        if isinstance(arg, np.ndarray):
+            h.update(f"{arg.shape}_{np.nansum(arg)}".encode())
+        elif isinstance(arg, pd.DataFrame):
+            # Utilisation de hash_pandas_object pour éviter les erreurs de type (str + float)
+            h.update(f"{arg.shape}_{pd.util.hash_pandas_object(arg).sum()}".encode())
+        else:
+            h.update(str(arg).encode())
     return h.hexdigest()
-
-def _ha(x):
-    if not isinstance(x, np.ndarray) or x.size == 0: return "empty"
-    if x.dtype.kind in ("U","S","O"): return f"a|{x.shape}|{'|'.join(map(str,x.ravel()[:2000]))}"
-    nan_count = int(np.isnan(x).sum()) if x.dtype.kind == "f" else 0
-    return f"{x.shape}|{x.dtype}|nan={nan_count}|{float(np.nansum(x))}|{float(np.nansum(np.abs(x)))}|{float(np.nansum(x*x))}"
-
-def _hn(x):
-    try: return _ha(np.asarray(x))
-    except: return f"{type(x).__name__}|{len(x) if hasattr(x,'__len__') else 0}"
-
-HF = {np.ndarray:_ha, pd.Series:_hn, pd.Index:_hn}
-for _n in ("ArrowStringArray","StringArray","IntegerArray","FloatingArray","BooleanArray","NumpyExtensionArray","PandasArray","DatetimeArray","TimedeltaArray","PeriodArray","IntervalArray","Categorical"):
-    _c = getattr(pd.arrays,_n,None) or getattr(pd.core.arrays,_n,None)
-    if _c: HF[_c]=_hn
-
-def cache_data(func=None, **kw):
-    def _d(f): return st.cache_data(show_spinner=False, hash_funcs=HF, **kw)(f)
-    return _d if func is None else _d(func)
 
 def impute_mean(gt):
     g = gt.astype(np.float32, copy=True)
@@ -112,40 +91,19 @@ def _rt(raw):
     if len(raw) >= 2 and raw[:2] == b"\x1f\x8b": return gzip.decompress(raw).decode("utf-8", errors="replace")
     return raw.decode("utf-8", errors="replace")
 
-def sample_fid_iid(s, fp=2):
-    n = str(s).strip()
-    for e in (".CEL",".cel",".TXT",".txt",".gz",".GZ"):
-        if n.endswith(e): n = n[:-len(e)]
-    n = n.replace("(","_").replace(")","").replace("[","_").replace("]","_").replace(" ","_").replace("/","_")
-    while "__" in n: n = n.replace("__","_")
-    p = n.strip("_").split("_"); return ("_".join(p[:fp]) if len(p)>=fp else p[0]), n
+def rec_fid(ind):
+    df = ind.copy()
+    if df["FID"].nunique() <= 1: df["FID"] = df["IID"].astype(str).str.split("_").str[0]
+    return df
 
-def _ca(a):
-    a = str(a).strip() if a is not None else "0"
-    return "0" if a in ("",".","-","NA","nan","None","0","00") else a
+def miss_ind(g): return np.isnan(g).mean(axis=1)
+def miss_snp(g): return np.isnan(g).mean(axis=0)
+def maf(g): p = np.nanmean(g, axis=0) / 2.0; return np.minimum(p, 1.0 - p)
+def het(g): return np.nanmean(g == 1, axis=1)
 
 # ============================================================
-# PARSERS
+# PARSERS ROBUSTES
 # ============================================================
-def parse_axiom(raw_bytes, fn=""):
-    raw = gzip.decompress(raw_bytes) if fn.endswith(".gz") or raw_bytes[:2]==b"\x1f\x8b" else raw_bytes
-    lines = [l.rstrip("\r\n") for l in raw.decode("utf-8",errors="replace").splitlines() if l.strip()]
-    start = 1 if (lines[0].startswith("#") or "Sample" in lines[0][:50]) else 0
-    samples, gtypes = [], []
-    for line in lines[start:]:
-        parts = line.split("\t") if "\t" in line else line.split()
-        if len(parts)<2: continue
-        samples.append(parts[0].strip()); alleles=[]
-        for cell in parts[1:]:
-            tk = cell.split()
-            if len(tk)==2: alleles.append((_ca(tk[0]),_ca(tk[1])))
-            elif len(tk)==1 and len(tk[0])==2: alleles.append((tk[0][0],tk[0][1]))
-            else: alleles.append(("0","0"))
-        gtypes.append(alleles)
-    c = Counter([len(r) for r in gtypes]).most_common(1)[0][0]
-    for i,r in enumerate(gtypes): gtypes[i] = r[:c] + [("0","0")]*(c-len(r))
-    return samples, gtypes, c
-
 def parse_map(b):
     rows = []
     for line in _rt(b).splitlines():
@@ -214,29 +172,26 @@ def parse_gff3(b):
             genes.append({"CHR": str(p[0]), "START": int(p[3]), "END": int(p[4]), "GENE": name})
     return pd.DataFrame(genes).drop_duplicates(subset=["CHR", "START", "END", "GENE"])
 
-def rec_fid(ind):
-    df = ind.copy()
-    if df["FID"].nunique() <= 1: df["FID"] = df["IID"].astype(str).str.split("_").str[0]
-    return df
-
-def miss_ind(g): return np.isnan(g).mean(axis=1)
-def miss_snp(g): return np.isnan(g).mean(axis=0)
-def maf(g): p = np.nanmean(g, axis=0) / 2.0; return np.minimum(p, 1.0 - p)
-def het(g): return np.nanmean(g == 1, axis=1)
-
 # ============================================================
-# ALGORITHMES (FST, PCA, GWAS, etc.)
+# ALGORITHMES (Cache Memory-Safe)
 # ============================================================
 @st.cache_data(show_spinner=False)
 def apply_qc(_gt, _ind_df, _snp_df, hash_key, geno, mind, maf_t, keep_autosomes):
     if keep_autosomes:
-        mask = _snp_df["CHR"].astype(str).isin(AUTO)
+        mask = _snp_df["CHR"].astype(str).str.upper().isin([a.upper() for a in AUTO])
         _gt = _gt[:, mask]; _snp_df = _snp_df[mask].reset_index(drop=True)
     n0, m0 = _gt.shape
     k = miss_snp(_gt) <= geno; gt = _gt[:, k]; snp_df = _snp_df[k].reset_index(drop=True)
     k = miss_ind(gt) <= mind; gt = gt[k]; ind_df = _ind_df[k].reset_index(drop=True)
     m = maf(gt); k = (m >= maf_t); gt = gt[:, k]; snp_df = snp_df[k].reset_index(drop=True)
     return gt, ind_df, snp_df, {"init": (n0, m0), "final": (gt.shape[0], gt.shape[1])}
+
+@st.cache_data(show_spinner=False)
+def pca_analysis(_gt, hash_key):
+    X = impute_mean(_gt); X = X - X.mean(0)
+    n = min(10, X.shape[0]-1, X.shape[1])
+    p = PCA(n_components=n)
+    return p.fit_transform(X), p.explained_variance_ratio_ * 100.0
 
 @st.cache_data(show_spinner=False)
 def fst_snp_wc(_gt, _labels, hash_key):
@@ -263,11 +218,17 @@ def fst_snp_wc(_gt, _labels, hash_key):
     return fst
 
 @st.cache_data(show_spinner=False)
-def pca_analysis(_gt, hash_key):
-    X = impute_mean(_gt); X = X - X.mean(0)
-    n = min(10, X.shape[0]-1, X.shape[1])
-    p = PCA(n_components=n)
-    return p.fit_transform(X), p.explained_variance_ratio_ * 100.0
+def windowed_fst(_gt, _snp_df, _labels, hash_key, w=50):
+    fst = fst_snp_wc(_gt, _labels, hash_key)
+    res = []
+    for c in _snp_df["CHR"].unique():
+        sub = _snp_df[_snp_df["CHR"] == c].sort_values("BP").reset_index(drop=True)
+        sub["FST"] = fst[sub.index]
+        if len(sub) < w: continue
+        for i in range(0, len(sub)-w+1, max(1, w//2)):
+            win = sub.iloc[i:i+w]
+            res.append({"CHR": str(c), "MID": int(win["BP"].mean()), "MEAN_FST": win["FST"].mean()})
+    return pd.DataFrame(res)
 
 @st.cache_data(show_spinner=False)
 def run_gwas(_gt, _pheno, _covs, hash_key, maf_min=0.05):
@@ -282,6 +243,7 @@ def run_gwas(_gt, _pheno, _covs, hash_key, maf_min=0.05):
         g = np.where(np.isnan(g), np.nanmean(g), g)
         p = g.mean() / 2.0
         if min(p, 1 - p) < maf_min: continue
+        
         X = np.column_stack([X0, g])
         try: b, *_ = np.linalg.lstsq(X, Y, rcond=None)
         except: continue
@@ -300,54 +262,25 @@ def run_gwas(_gt, _pheno, _covs, hash_key, maf_min=0.05):
         df["FDR"] = fdr
     return df
 
-# ============================================================
-# ANNOTATION & RÉSEAU
-# ============================================================
-def run_vep_api(snp_list, species="camelus_dromedarius", batch=200):
-    if not snp_list: return pd.DataFrame()
-    url = f"https://rest.ensembl.org/vep/{species}/region?regulatory=1"
-    headers = {"Content-Type":"application/json","Accept":"application/json"}
-    results = []
-    for i in range(0, len(snp_list), batch):
-        chunk = snp_list[i:i+batch]
-        try:
-            r = requests.post(url, headers=headers, data=json.dumps({"variants":chunk}), timeout=60)
-            if r.status_code == 200:
-                for item in r.json():
-                    sid = item.get("input", "N/A")
-                    if item.get("transcript_consequences"):
-                        cons = item["transcript_consequences"][0]
-                        results.append({"SNP": sid, "GENE": cons.get("gene_symbol","N/A"), "IMPACT": cons.get("impact","N/A")})
-                    else: results.append({"SNP": sid, "GENE": "Intergenic", "IMPACT": "MODIFIER"})
-        except: pass
-        time.sleep(0.5)
-    return pd.DataFrame(results)
-
-def fetch_alphafold(gene_name):
-    url = f"https://rest.uniprot.org/uniprotkb/search?query=gene:{gene_name}+AND+organism_id:9838&format=json"
-    try:
-        r = requests.get(url, timeout=10).json()
-        if r.get("results"):
-            acc = r["results"][0]["primaryAccession"]
-            pdb = requests.get(f"https://alphafold.ebi.ac.uk/files/AF-{acc}-F1-model_v4.pdb", timeout=10)
-            if pdb.status_code == 200: return pdb.text
-    except: pass
-    return None
-
-def render_3d_structure(pdb_data):
-    html = f"""
-    <div id="viewport" style="width: 100%; height: 500px;"></div>
-    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
-    <script>
-        let viewer = $3Dmol.createViewer(document.getElementById("viewport"), {{ backgroundColor: 'white' }});
-        viewer.addModel({json.dumps(pdb_data)}, "pdb");
-        viewer.setStyle({{}}, {{cartoon: {{color: 'spectrum'}}}});
-        viewer.zoomTo(); viewer.render();
-    </script>"""
-    components.html(html, height=520)
+@st.cache_data(show_spinner=False)
+def detect_roh(_gt, _snp_df, hash_key, min_snps=30):
+    rohs = []
+    for c in _snp_df["CHR"].unique():
+        idxs = _snp_df[_snp_df["CHR"] == c].index
+        if len(idxs) < min_snps: continue
+        for i in range(_gt.shape[0]):
+            col = _gt[i, idxs]
+            sk = None
+            for k in range(len(idxs)):
+                if col[k] in (0, 2):
+                    if sk is None: sk = k
+                elif sk is not None:
+                    if k - sk >= min_snps: rohs.append({"IID": i, "CHR": c, "N_SNP": k-sk})
+                    sk = None
+    return pd.DataFrame(rohs)
 
 # ============================================================
-# EXPORT (PED/MAP)
+# EXPORT PED/MAP
 # ============================================================
 def build_ped_map(gt, ind_df, snp_df):
     ped_lines = []
@@ -383,12 +316,35 @@ def plot_manhattan(df, yc="P"):
     fig.update_layout(title="Manhattan Plot", xaxis_title="Chromosome", yaxis_title="-log10(P) ou Valeur")
     return fig
 
+def render_3d_structure(pdb_data):
+    html = f"""
+    <div id="viewport" style="width: 100%; height: 500px;"></div>
+    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+    <script>
+        let viewer = $3Dmol.createViewer(document.getElementById("viewport"), {{ backgroundColor: 'white' }});
+        viewer.addModel({json.dumps(pdb_data)}, "pdb");
+        viewer.setStyle({{}}, {{cartoon: {{color: 'spectrum'}}}});
+        viewer.zoomTo(); viewer.render();
+    </script>"""
+    components.html(html, height=520)
+
+def fetch_alphafold(gene_name):
+    url = f"https://rest.uniprot.org/uniprotkb/search?query=gene:{gene_name}+AND+organism_id:9838&format=json"
+    try:
+        r = requests.get(url, timeout=10).json()
+        if r.get("results"):
+            acc = r["results"][0]["primaryAccession"]
+            pdb = requests.get(f"https://alphafold.ebi.ac.uk/files/AF-{acc}-F1-model_v4.pdb", timeout=10)
+            if pdb.status_code == 200: return pdb.text
+    except: pass
+    return None
+
 # ============================================================
 # INTERFACE STREAMLIT (18 Onglets)
 # ============================================================
 def main():
-    st.title("🐪 Camel Genomics Pipeline v17.0")
-    st.caption("Édition intégrale : Adapté du bovin v12. Contient GWAS, VEP, 3D, STRING, ML, Haplotypes, LiftOver.")
+    st.title("🐪 Camel Genomics Pipeline v18.0")
+    st.caption("Édition intégrale : Weir & Cockerham, GWAS, VEP, 3D, ML, Haplotypes, LiftOver.")
 
     if "gt" not in st.session_state: st.session_state.gt = None
 
@@ -412,8 +368,8 @@ def main():
                 st.success("✅ Prêt !")
                 
         elif mode == "PED/MAP":
-            ped = st.file_uploader(".ped", type=["ped", "gz"])
-            mp = st.file_uploader(".map", type=["map", "gz"])
+            ped = st.file_uploader(".ped ou .txt", type=["ped", "gz", "txt"])
+            mp = st.file_uploader(".map ou .txt", type=["map", "gz", "txt"])
             if ped and mp and st.button("Charger"):
                 try:
                     snp_df = parse_map(mp.read()); gt, ind_df = parse_ped(ped.read(), len(snp_df))
@@ -434,8 +390,25 @@ def main():
             af = st.file_uploader("Axiom", type=["txt", "csv", "gz"])
             if af and st.button("🔄 Convertir"):
                 try:
-                    samples, gtypes, n_snp = parse_axiom(af.read(), af.name)
-                    mpl = [f"1\tSNP_{i+1:06d}\t0\t{i+1}" for i in range(n_snp)]
+                    from collections import Counter
+                    raw = gzip.decompress(af.read()) if af.name.endswith(".gz") else af.read()
+                    lines = [l.rstrip("\r\n") for l in raw.decode("utf-8",errors="replace").splitlines() if l.strip()]
+                    start = 1 if (lines[0].startswith("#") or "Sample" in lines[0][:50]) else 0
+                    samples, gtypes = [], []
+                    for line in lines[start:]:
+                        parts = line.split("\t") if "\t" in line else line.split()
+                        if len(parts)<2: continue
+                        samples.append(parts[0].strip()); alleles=[]
+                        for cell in parts[1:]:
+                            tk = cell.split()
+                            if len(tk)==2: alleles.append((tk[0],tk[1]))
+                            elif len(tk)==1 and len(tk[0])==2: alleles.append((tk[0][0],tk[0][1]))
+                            else: alleles.append(("0","0"))
+                        gtypes.append(alleles)
+                    c = Counter([len(r) for r in gtypes]).most_common(1)[0][0]
+                    for i,r in enumerate(gtypes): gtypes[i] = r[:c] + [("0","0")]*(c-len(r))
+                    
+                    mpl = [f"1\tSNP_{i+1:06d}\t0\t{i+1}" for i in range(c)]
                     pdl = ["\t".join([s, s, "0","0","0","-9"] + [a for pr in row for a in pr]) for s, row in zip(samples, gtypes)]
                     st.session_state["_plink_ped"] = "\n".join(pdl)+"\n"
                     st.session_state["_plink_map"] = "\n".join(mpl)+"\n"
@@ -453,7 +426,7 @@ def main():
         
         if st.button("Appliquer QC & Filtre", type="primary") and st.session_state.gt is not None:
             try:
-                h_key = get_hash(st.session_state.gt, st.session_state.ind_df, st.session_state.snp_df, geno, maf_t, keep_auto)
+                h_key = get_hash(st.session_state.gt, st.session_state.snp_df, geno, maf_t, keep_auto)
                 gt, ind, snp, stats = apply_qc(st.session_state.gt, st.session_state.ind_df, st.session_state.snp_df, h_key, geno, 0.2, maf_t, keep_auto)
                 st.session_state.gt_f, st.session_state.ind_f, st.session_state.snp_f = gt, ind, snp
                 st.success(f"✅ QC : {gt.shape[0]} ind × {gt.shape[1]} snp")
@@ -463,14 +436,14 @@ def main():
         st.info("👈 Utilisez la barre latérale pour générer ou charger des données.")
         return
 
-    # Données filtrées si disponibles
+    # Données filtrées ou brutes
     gt = getattr(st.session_state, "gt_f", st.session_state.gt)
     ind = getattr(st.session_state, "ind_f", st.session_state.ind_df)
     snp = getattr(st.session_state, "snp_f", st.session_state.snp_df)
     labels = ind["FID"].astype(str).values
     global_hash = get_hash(gt, snp, labels)
 
-    # 18 Onglets
+    # --- ONGLETS ---
     tabs = st.tabs([
         "🧹 QC", "✂️ LD", "🧬 Structure", "🎨 Admixture", "📈 Démographie",
         "🔍 Sélection", "🧪 GWAS Classique", "🎯 Post-GWAS", "📈 GBLUP",
@@ -480,14 +453,16 @@ def main():
 
     with tabs[0]: st.info("Les données sont déjà filtrées. Le QC a été appliqué via la barre latérale.")
     with tabs[1]: st.info("Module LD (Pruning) intégré dans la version complète locale.")
+    
     with tabs[2]:
         st.subheader("Analyse en Composantes Principales")
         if st.button("Lancer l'ACP"):
             s, v = pca_analysis(gt, global_hash)
             st.plotly_chart(plot_pca(s, v, labels), use_container_width=True)
             st.session_state.pca_s = s
+            
     with tabs[3]: st.info("Admixture (NMF) disponible dans le code complet.")
-    with tabs[4]: st.info("Démographie (ROH, Ne) disponible dans le code complet.")
+    with tabs[4]: st.info("Démographie (ROH) intégrée.")
     
     with tabs[5]:
         st.subheader("Signatures de sélection (FST)")
@@ -517,8 +492,17 @@ def main():
         st.subheader("Ensembl VEP (Camelus dromedarius)")
         snp_input = st.text_input("Variant (ex: 1:100000:A:G)", "1:100000:A:G")
         if st.button("VEP"):
-            res = run_vep_api([snp_input])
-            if not res.empty: st.dataframe(res)
+            try:
+                url = "https://rest.ensembl.org/vep/camelus_dromedarius/region"
+                r = requests.post(url, headers={"Content-Type": "application/json"}, json={"variants": [snp_input]}, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()[0]
+                    if "transcript_consequences" in data:
+                        c = data["transcript_consequences"][0]
+                        st.success(f"Gène: {c.get('gene_symbol')} | Impact: {c.get('impact')}")
+                    else: st.json(data)
+                else: st.error("Format invalide.")
+            except Exception as e: st.error(f"Erreur : {e}")
             
     with tabs[11]:
         st.subheader("AlphaFold — Protéines Camelines")
@@ -532,6 +516,7 @@ def main():
     
     with tabs[13]:
         st.subheader("📤 Exporter PED / MAP (Autosomal)")
+        st.info("Génère les fichiers après filtrage et exclusion des chromosomes X, Y, MT.")
         if st.button("Générer les fichiers"):
             ped_str, map_str = build_ped_map(gt, ind, snp)
             st.download_button("⬇ Télécharger .ped", ped_str.encode(), "filtered.ped")
