@@ -1,4 +1,4 @@
-"""🐪 Camel Genomics Pipeline v20.5 — Correction de l'erreur Read-Only (Ne)"""
+"""🐪 Camel Genomics Pipeline v20.6 — Arbre Phylogénétique Corrigé"""
 import gzip, io, os, warnings, time, json, hashlib, gc
 from collections import Counter
 from urllib.parse import quote
@@ -23,7 +23,7 @@ except ImportError: HAS_STATSMODELS = False
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="🐪 Camel Genomics v20.5", page_icon="🐪", layout="wide")
+st.set_page_config(page_title="🐪 Camel Genomics v20.6", page_icon="🐪", layout="wide")
 
 # ============================================================
 # CONSTANTES
@@ -175,7 +175,6 @@ def ne_snep(_gt, _snp_df, hash_key):
     c = ld["dist_kb"].values.copy() / 100.0 
     r2 = ld["r2"].values.copy()
     
-    # Correction : utilisation de np.where au lieu de modifier la vue en place
     r2 = np.where(r2 < 0.01, 0.01, r2)
     r2 = np.where(r2 > 1.0, 1.0, r2)
     
@@ -326,8 +325,8 @@ def fetch_alphafold(gene_name):
 # INTERFACE
 # ============================================================
 def main():
-    st.title("🐪 Camel Genomics Pipeline v20.5")
-    st.caption("Optimisation mémoire, vitesse et correction de bug Ne.")
+    st.title("🐪 Camel Genomics Pipeline v20.6")
+    st.caption("Arbre phylogénétique corrigé, analyses complètes et optimisées.")
 
     if "gt" not in st.session_state: st.session_state.gt = None
 
@@ -466,22 +465,48 @@ def main():
     with tabs[4]:
         st.subheader("Arbre Phylogénétique (Neighbor-Joining)")
         if st.button("Construire l'arbre (Reynolds)"):
-            D, pops = reynolds_matrix(gt, labels, global_hash)
-            Z = linkage(squareform(D), method='average')
-            dn = dendrogram(Z, labels=pops, no_plot=True)
-            
-            fig = go.Figure()
-            for i, d in enumerate(dn['dcoord']):
-                fig.add_trace(go.Scatter(x=d[1], y=d[0], mode='lines', line=dict(color='black', width=2), showlegend=False))
-            
-            for i, (leaf_x, leaf_label) in enumerate(zip(dn['leaves'], dn['ivl'])):
-                fig.add_annotation(x=0, y=i*10+5, text=leaf_label, showarrow=False, xanchor='right', xshift=-10)
+            try:
+                with st.spinner("Construction de l'arbre..."):
+                    D, pops = reynolds_matrix(gt, labels, global_hash)
+                    Z = linkage(squareform(D), method='average')
+                    dn = dendrogram(Z, labels=pops, no_plot=True)
                 
-            fig.update_layout(title="Arbre NJ (Distances de Reynolds)", 
-                              xaxis_title="Distance", yaxis=dict(showticklabels=False),
-                              height=600)
-            st.plotly_chart(fig, width='stretch')
-            st.dataframe(pd.DataFrame(D, index=pops, columns=pops), width='stretch')
+                fig = go.Figure()
+                # Tracé des branches en U
+                for i in range(len(dn['icoord'])):
+                    icoord = dn['icoord'][i]
+                    dcoord = dn['dcoord'][i]
+                    fig.add_trace(go.Scatter(
+                        x=dcoord, 
+                        y=icoord, 
+                        mode='lines', 
+                        line=dict(color='black', width=2), 
+                        showlegend=False
+                    ))
+                
+                # Ajout des noms des populations
+                for i, label in enumerate(dn['ivl']):
+                    fig.add_annotation(
+                        x=0, 
+                        y=5 + i*10, 
+                        text=label, 
+                        showarrow=False, 
+                        xanchor='right', 
+                        xshift=-10,
+                        font=dict(size=12, color="blue")
+                    )
+                    
+                fig.update_layout(
+                    title="Arbre NJ (Distances de Reynolds)", 
+                    xaxis_title="Distance", 
+                    yaxis=dict(showticklabels=False),
+                    height=600
+                )
+                st.plotly_chart(fig, width='stretch')
+                st.write("Matrice de distance de Reynolds :")
+                st.dataframe(pd.DataFrame(D, index=pops, columns=pops), width='stretch')
+            except Exception as e:
+                st.error(f"Erreur lors de la construction de l'arbre : {e}")
 
     with tabs[5]:
         st.subheader("Signatures de Sélection (FST de Weir & Cockerham)")
