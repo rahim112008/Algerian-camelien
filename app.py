@@ -1,4 +1,4 @@
-"""🐪 Camel Genomics Pipeline v20.1 — Toutes les analyses génomiques fonctionnelles (Corrigé)"""
+"""🐪 Camel Genomics Pipeline v20.2 — 100% Stable, Toutes les analyses"""
 import gzip, io, os, warnings, time, json, hashlib
 from collections import Counter
 from urllib.parse import quote
@@ -8,10 +8,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+
+# --- IMPORTS SCIPY CORRIGÉS ---
 from scipy import stats
 from scipy.stats import t as t_dist
 from scipy.cluster.hierarchy import linkage, dendrogram
-from scipy.spatial.distance import squareform  # <-- CORRECTION ICI
+from scipy.spatial.distance import squareform  # <-- L'IMPORT CORRECT EST ICI
+
 from sklearn.decomposition import NMF, PCA
 from sklearn.ensemble import RandomForestRegressor
 import requests
@@ -23,7 +26,7 @@ except ImportError: HAS_STATSMODELS = False
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🐪 Camel Genomics v20.1", page_icon="🐪", layout="wide")
+st.set_page_config(page_title="🐪 Camel Genomics v20.2", page_icon="🐪", layout="wide")
 
 # ============================================================
 # CONSTANTES GÉNOMIQUES — Camelus dromedarius (2n=74)
@@ -79,7 +82,7 @@ def miss_snp(g): return np.isnan(g).mean(axis=0)
 def maf(g): p = np.nanmean(g, axis=0) / 2.0; return np.minimum(p, 1.0 - p)
 
 # ============================================================
-# PARSERS
+# PARSERS ROBUSTES
 # ============================================================
 def parse_map(b):
     rows = []
@@ -300,8 +303,8 @@ def fetch_alphafold(gene_name):
 # INTERFACE STREAMLIT
 # ============================================================
 def main():
-    st.title("🐪 Camel Genomics Pipeline v20.1")
-    st.caption("Toutes les analyses du manuscrit + GWAS, FST, ROH, VEP, 3D.")
+    st.title("🐪 Camel Genomics Pipeline v20.2")
+    st.caption("Analyse Complète : Manuscrit + FST + ROH + GWAS + VEP + 3D.")
 
     if "gt" not in st.session_state: st.session_state.gt = None
 
@@ -400,7 +403,8 @@ def main():
             fig = px.scatter(pd.DataFrame({"PC1": s[:, 0], "PC2": s[:, 1], "Pop": labels}),
                              x="PC1", y="PC2", color="Pop", title=f"ACP : PC1 ({v[0]:.1f}%) vs PC2 ({v[1]:.1f}%)")
             fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
-            st.plotly_chart(fig, use_container_width=True)
+            # Mise à jour API Streamlit
+            st.plotly_chart(fig, width='stretch')
             st.session_state.pca_s = s
 
     with tabs[1]:
@@ -409,7 +413,7 @@ def main():
             ld_df = ld_decay(gt, snp, global_hash)
             if not ld_df.empty:
                 fig = px.line(ld_df, x="dist_kb", y="r2", title="LD Decay (r²)")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
             else: st.warning("Pas assez de SNPs.")
 
     with tabs[2]:
@@ -418,7 +422,7 @@ def main():
             ne_df = ne_snep(gt, snp, global_hash)
             if not ne_df.empty:
                 fig = px.line(ne_df, x="Generations", y="Ne", title="Ne à travers le temps (Méthode SNeP)")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
             else: st.warning("Impossible d'estimer Ne.")
 
     with tabs[3]:
@@ -431,7 +435,7 @@ def main():
             df_melt = df_q.melt(id_vars=["Pop", "x"], var_name="Cluster", value_name="Prop")
             fig = px.bar(df_melt, x="x", y="Prop", color="Cluster", title=f"Admixture K={K}")
             fig.update_layout(barmode='stack', xaxis_visible=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     with tabs[4]:
         st.subheader("Arbre Phylogénétique (Neighbor-Joining)")
@@ -450,9 +454,9 @@ def main():
             fig.update_layout(title="Arbre NJ (Distances de Reynolds)", 
                               xaxis_title="Distance", yaxis=dict(showticklabels=False),
                               height=600)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             st.write("Matrice de distance de Reynolds :")
-            st.dataframe(pd.DataFrame(D, index=pops, columns=pops))
+            st.dataframe(pd.DataFrame(D, index=pops, columns=pops), width='stretch')
 
     with tabs[5]:
         st.subheader("Signatures de Sélection (FST de Weir & Cockerham)")
@@ -463,8 +467,8 @@ def main():
             if not df_fst.empty:
                 df_fst = df_fst.assign(_k=df_fst["CHR"].map(_chk)).sort_values(["_k", "BP"]).reset_index(drop=True)
                 fig = px.scatter(df_fst, x=df_fst.index, y="FST", color="CHR", title="FST par SNP (Sélection)")
-                st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(df_fst.sort_values("FST", ascending=False).head(10))
+                st.plotly_chart(fig, width='stretch')
+                st.dataframe(df_fst.sort_values("FST", ascending=False).head(10), width='stretch')
 
     with tabs[6]:
         st.subheader("Démographie : ROH (Runs of Homozygosity)")
@@ -472,7 +476,7 @@ def main():
             roh = detect_roh(gt, snp, global_hash)
             if not roh.empty:
                 st.metric("ROH détectés", len(roh))
-                st.dataframe(roh)
+                st.dataframe(roh, width='stretch')
             else: st.info("Aucun ROH détecté.")
 
     with tabs[7]:
@@ -485,7 +489,7 @@ def main():
                     res["SNP"] = snp["SNP"].values[res["SNP_idx"]]
                     res["CHR"] = snp["CHR"].values[res["SNP_idx"]]
                     res["BP"] = snp["BP"].values[res["SNP_idx"]]
-                    st.dataframe(res.sort_values("P").head(10))
+                    st.dataframe(res.sort_values("P").head(10), width='stretch')
                 else: st.warning("Aucun SNP significatif.")
 
     with tabs[8]:
