@@ -13,9 +13,6 @@ from scipy.optimize import minimize_scalar
 from scipy.stats import t as t_dist
 from sklearn.decomposition import NMF, PCA
 from sklearn.manifold import MDS as SklearnMDS
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score
 import requests, time, json
 import streamlit.components.v1 as components
 
@@ -25,41 +22,19 @@ try:
 except ImportError:
     HAS_BIO = False
 
-try:
-    from statsmodels.stats.multitest import multipletests
-    HAS_STATSMODELS = True
-except ImportError:
-    HAS_STATSMODELS = False
-
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🐪 Dromedary Pipeline v1.3", page_icon="🐪",
+st.set_page_config(page_title="🐪 Dromedary Pipeline v1.4", page_icon="🐪",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
-# 🔬 PARAMÈTRES SPÉCIFIQUES AU DROMADAIRE (Camelus dromedarius)
+# PARAMÈTRES DROMADAIRE
 # ============================================================
 ARS = {str(i): 100_000_000 for i in range(1, 37)} 
 AUTO = [str(i) for i in range(1, 37)]
 
-GROUPES_DEFAULT = {
-    "Origine géographique (Algérie)": {
-        "SAHARA": ["SAHRAOUI", "REGIBI", "DZA_AOS"],
-        "STEPPE": ["OULED_SIDI_CHEIKH", "CHAAMBI", "DZA_ACM", "DZA_ANL"],
-        "MONTAGNE": ["TARGUI", "DZA_ATR", "DZA_AZA"]
-    }
-}
-
-def make_group_map(group_dict):
-    return {r.upper(): grp for grp, races in group_dict.items() for r in races}
-
-def apply_group_mapping(ind_df, group_map, default="AUTRE"):
-    df = ind_df.copy(); df["FID"] = df["FID"].astype(str).str.upper()
-    df["FID_GROUPE"] = df["FID"].map(group_map).fillna(default)
-    return df
-
 # ============================================================
-# CACHE & UTILS
+# UTILS & PARSERS
 # ============================================================
 def _ha(x):
     if not isinstance(x, np.ndarray) or x.size == 0: return "empty"
@@ -105,6 +80,7 @@ def sample_fid_iid(s, fp=2):
 def _ca(a):
     a=str(a).strip() if a is not None else "0"; return "0" if a in ("",".","-","NA","nan","None","0","00") else a
 
+# 🌟 CONVERSION AXIOM (Réintégrée)
 def parse_axiom(raw_bytes, fn=""):
     raw = gzip.decompress(raw_bytes) if fn.endswith(".gz") or raw_bytes[:2]==b"\x1f\x8b" else raw_bytes
     lines = [l.rstrip("\r\n") for l in raw.decode("utf-8", errors="replace").splitlines() if l.strip()]
@@ -187,36 +163,14 @@ def parse_ped(b, n_map):
                 gt[i,j]=(r[2*j]==minor[j])+(r[2*j+1]==minor[j])
     return gt, pd.DataFrame({"FID":fids,"IID":iids}), alleles_A1, alleles_A2
 
-def parse_vcf(b):
-    samples,rows=[],[]
-    for line in _rt(b).splitlines():
-        if line.startswith("#CHROM"): samples=line.split("\t")[9:]
-        elif line.strip() and not line.startswith("#"):
-            p=line.split("\t")
-            if len(p)>=10 and "," not in p[4]:
-                fmt=p[8].split(":")
-                if "GT" in fmt:
-                    gi=fmt.index("GT"); gts=np.full(len(samples),np.nan,dtype=np.float32)
-                    for k,s in enumerate(p[9:]):
-                        al=s.split(":")[gi].replace("|","/").split("/")
-                        if not any(a in (".","") for a in al):
-                            try: gts[k]=sum(int(a) for a in al)
-                            except: pass
-                    try: bp = int(float(p[1]))
-                    except (ValueError, TypeError): continue
-                    rows.append({"CHR":str(p[0]),"SNP":p[2] or f"{p[0]}:{p[1]}","CM":0.0,"BP":bp, "A1":p[3],"A2":p[4],"GT":gts})
-    if not rows: raise ValueError("Aucun variant VCF")
-    gt=np.zeros((len(samples),len(rows)),dtype=np.float32)
-    for j,r in enumerate(rows):
-        gt[:,j]=r["GT"]; v=gt[:,j][~np.isnan(gt[:,j])]
-        if len(v)>0 and v.mean()/2.0>0.5: gt[:,j]=np.where(np.isnan(gt[:,j]),np.nan,2.0-gt[:,j])
-    return gt, pd.DataFrame({"FID":samples,"IID":samples}), pd.DataFrame([{k:v for k,v in r.items() if k!="GT"} for r in rows])
-
 def rec_fid(ind):
     df=ind.copy()
     if df["FID"].nunique()<=1: df["FID"]=df["IID"].astype(str).str.split("_").str[0]
     return df
 
+# ============================================================
+# CALCULS GÉNÉTIQUES
+# ============================================================
 def miss_ind(g): return np.isnan(g).mean(axis=1)
 def miss_snp(g): return np.isnan(g).mean(axis=0)
 def maf(g): p=np.nanmean(g,axis=0)/2.0; return np.minimum(p,1.0-p)
@@ -260,22 +214,19 @@ def apply_qc(gt, ind_df, snp_df, params, rem_out=True, autosomal_only=True):
         is_auto = snp_df["CHR"].astype(str).str.replace("chr","").isin(AUTO)
         gt = gt[:, is_auto.values]; snp_df = snp_df[is_auto].reset_index(drop=True)
         tr["autosomal"] = int(m0 - gt.shape[1])
-    k=miss_snp(gt)<=params["geno"]; gt=gt[:,k]; snp_df=snp_df[k].reset_index(drop=True); tr["geno"]=int(m0-gt.shape[1])
-    k=miss_ind(gt)<=params["mind"]; gt=gt[k]; ind_df=ind_df[k].reset_index(drop=True); tr["mind"]=int(n0-gt.shape[0])
+    k=miss_snp(gt)<=params["geno"]; gt=gt[:,k]; snp_df=snp_df[k].reset_index(drop=True)
+    k=miss_ind(gt)<=params["mind"]; gt=gt[k]; ind_df=ind_df[k].reset_index(drop=True)
     m=maf(gt); k=np.isfinite(m)&(m>=params["maf"]); gt=gt[:,k]; snp_df=snp_df[k].reset_index(drop=True)
     pv=hwe_pvals(gt); k=np.isnan(pv)|(pv>=params["hwe"]); gt=gt[:,k]; snp_df=snp_df[k].reset_index(drop=True)
     if gt.shape[1]==0: raise ValueError("Tout exclu (MAF/HWE)")
-    gt_pre,ind_pre,snp_pre=gt.copy(),ind_df.copy(),snp_df.copy()
     if rem_out:
         h=het(gt); kp=np.ones(len(h),dtype=bool)
         for f in ind_df["FID"].unique():
             msk=(ind_df["FID"]==f).values; sub=h[msk]
             if len(sub)>=5 and np.nanstd(sub)>1e-9:
                 z=(sub-np.nanmean(sub))/np.nanstd(sub); idx=np.where(msk)[0]; kp[idx[np.abs(z)>params["het_sd"]]]=False
-        gt=gt[kp]; ind_df=ind_df[kp].reset_index(drop=True); tr["het"]=int(len(h)-len(ind_df))
-    return gt,ind_df,snp_df,gt_pre,ind_pre,snp_pre,{"n_ind_init":int(n0),"n_snp_init":int(m0),
-        "n_ind_final":int(gt.shape[0]),"n_snp_final":int(gt.shape[1]),"excluded_ind":int(n0-gt.shape[0]),
-        "excluded_snp":int(m0-gt.shape[1]),"trace":tr}
+        gt=gt[kp]; ind_df=ind_df[kp].reset_index(drop=True)
+    return gt, ind_df, snp_df
 
 @cache_data
 def compute_pop_stats(gt, ind_df):
@@ -291,9 +242,6 @@ def compute_pop_stats(gt, ind_df):
         stats.append({"Population": p, "N": int(mask.sum()), "Ho": round(Ho, 4), "He": round(He, 4), "F_mean": round(F, 4)})
     return pd.DataFrame(stats).sort_values("Population")
 
-# ============================================================
-# GÉNÉTIQUE & STRUCTURE
-# ============================================================
 @cache_data
 def fst_snp_wc(gt, labels):
     pops = np.unique(labels); r = len(pops); n_snp = gt.shape[1]
@@ -332,25 +280,6 @@ def windowed_fst(gt, snp_df, labels, w=50, step=25, use_wc84=False):
     return pd.DataFrame(res)
 
 @cache_data
-def tajimas_window(genos):
-    ni,ns=genos.shape
-    if ns<3 or ni<4: return np.nan,0
-    S=0; piv=[]
-    for j in range(ns):
-        col=genos[:,j]; col=col[~np.isnan(col)]
-        if len(col)<2: continue
-        p=col.mean()/2.0
-        if 0<p<1: S+=1; piv.append(2*p*(1-p)*(len(col)/(len(col)-1)))
-    if S==0 or not piv: return np.nan,int(S)
-    pi=np.mean(piv); n=ni*2
-    a1=np.sum(1.0/np.arange(1,n)); a2=np.sum(1.0/(np.arange(1,n)**2))
-    b1=(n+1)/(3*(n-1)); b2=2*(n**2+n+3)/(9*n*(n-1))
-    c1=b1-1/a1; c2=b2-(n+2)/(a1*n)+a2/(a1**2); e1=c1/a1; e2=c2/(a1**2+a2)
-    den=np.sqrt(e1*S+e2*S*(S-1))
-    if den<=1e-12: return np.nan,int(S)
-    return float((pi-S/a1)/den),int(S)
-
-@cache_data
 def tajimas_scan(gt, snp_df, w=25, step=10):
     snp=snp_df.copy().reset_index(drop=True); n=min(gt.shape[1],len(snp))
     snp=snp.iloc[:n].reset_index(drop=True); gt=gt[:,:n]; res=[]
@@ -359,11 +288,26 @@ def tajimas_scan(gt, snp_df, w=25, step=10):
         if len(idx)<w: continue
         idx=idx[np.argsort(snp["BP"].values[idx])]
         for i in range(0,len(idx)-w+1,step):
-            wi=idx[i:i+w]; D,S=tajimas_window(gt[:,wi])
-            if not np.isnan(D): res.append({"CHR":str(c),"START":int(snp.iloc[wi]["BP"].min()), "END":int(snp.iloc[wi]["BP"].max()),"MID":int((snp.iloc[wi]["BP"].min()+snp.iloc[wi]["BP"].max())/2), "N_SNP":len(wi),"S":S,"TAJIMA_D":D})
+            wi=idx[i:i+w]; genos=gt[:,wi]
+            ni,ns=genos.shape
+            if ns<3 or ni<4: continue
+            S=0; piv=[]
+            for j in range(ns):
+                col=genos[:,j]; col=col[~np.isnan(col)]
+                if len(col)<2: continue
+                p=col.mean()/2.0
+                if 0<p<1: S+=1; piv.append(2*p*(1-p)*(len(col)/(len(col)-1)))
+            if S==0 or not piv: continue
+            pi=np.mean(piv); n=ni*2
+            a1=np.sum(1.0/np.arange(1,n)); a2=np.sum(1.0/(np.arange(1,n)**2))
+            b1=(n+1)/(3*(n-1)); b2=2*(n**2+n+3)/(9*n*(n-1))
+            c1=b1-1/a1; c2=b2-(n+2)/(a1*n)+a2/(a1**2); e1=c1/a1; e2=c2/(a1**2+a2)
+            den=np.sqrt(e1*S+e2*S*(S-1))
+            if den>1e-12:
+                D = float((pi-S/a1)/den)
+                res.append({"CHR":str(c),"START":int(snp.iloc[wi]["BP"].min()), "END":int(snp.iloc[wi]["BP"].max()),"MID":int((snp.iloc[wi]["BP"].min()+snp.iloc[wi]["BP"].max())/2), "N_SNP":len(wi),"S":S,"TAJIMA_D":D})
     return pd.DataFrame(res)
 
-# 🌟 CSS : COMPOSITE SELECTION SCORE (NOUVEAU)
 @cache_data
 def composite_score(gt, snp_df, labels):
     fst = fst_snp_wc(gt, labels)
@@ -374,11 +318,9 @@ def composite_score(gt, snp_df, labels):
     n = min(len(df), len(fst), len(hom), len(maf_v))
     df = df.iloc[:n].reset_index(drop=True)
     df["FST"] = fst[:n]; df["HOM"] = hom[:n]; df["MAF"] = maf_v[:n]
-    
     def norm(x):
         mu, sd = np.nanmean(x), np.nanstd(x)
         return (x - mu) / sd if sd > 1e-9 else np.zeros_like(x)
-        
     df["Z_FST"] = norm(df["FST"].values)
     df["Z_HOM"] = norm(df["HOM"].values)
     df["CSS"] = np.abs(df["Z_FST"] * df["Z_HOM"])
@@ -408,17 +350,6 @@ def ld_pruning(gt, w=50, step=5, r2=0.2):
             we+=1
         i+=step
     return keep
-
-@cache_data
-def ld_decay(gt, bp, max_kb=1000, max_snp=1500, seed=42):
-    n=gt.shape[1]
-    if n<2: return pd.DataFrame(columns=["dist_kb","r2"])
-    idx=np.sort(np.random.default_rng(seed).choice(n,max_snp,replace=False)) if n>max_snp else np.arange(n)
-    g=impute_mean(gt[:,idx]); b=np.asarray(bp)[idx].astype(float)
-    X=g-g.mean(0); s=g.std(0); s[s<1e-8]=np.nan; X=X/s
-    C=(X.T@X)/X.shape[0]; R2=C**2; iu,ju=np.triu_indices(len(idx),k=1)
-    d=(b[ju]-b[iu])/1000.0; msk=(d>0)&(d<=max_kb)
-    return pd.DataFrame({"dist_kb":d[msk],"r2":R2[iu[msk],ju[msk]]})
 
 @cache_data
 def detect_roh(gt, snp_json, min_snps=15, min_kb=1000.0):
@@ -452,22 +383,8 @@ def detect_roh(gt, snp_json, min_snps=15, min_kb=1000.0):
     return (pd.DataFrame(rohs) if rohs else pd.DataFrame(columns=["IID_idx","CHR","start_bp","end_bp","n_snp","length_kb"])), fr
 
 # ============================================================
-# VEP & 3D
+# VEP & ANNOTATION (Corrigé avec Debug)
 # ============================================================
-_SEVERITY = {"HIGH": 4, "MODERATE": 3, "LOW": 2, "MODIFIER": 1}
-def traduire_consequence_vep(c):
-    c = str(c).lower()
-    if "missense" in c: return "🔴 Exon (Faux-sens)"
-    elif "synonymous" in c: return "🟡 Exon (Silencieuse)"
-    elif "stop_gained" in c or "frameshift" in c: return "⛔ Exon (Non-sens)"
-    elif "splice" in c: return "⚠️ Jonction"
-    elif "intron" in c: return "🟢 Intron"
-    elif "3_prime_utr" in c: return "🔵 3'UTR"
-    elif "5_prime_utr" in c: return "🔵 5'UTR"
-    elif "upstream" in c: return "🟣 Promoteur amont"
-    elif "downstream" in c: return "🟣 Aval"
-    return "⚪ Intergénique"
-
 def run_vep_api(snp_list, species="camelus_dromedarius", batch=200):
     if not snp_list: return pd.DataFrame()
     url = f"https://rest.ensembl.org/vep/{species}/region?regulatory=1"
@@ -481,64 +398,19 @@ def run_vep_api(snp_list, species="camelus_dromedarius", batch=200):
                 for item in r.json():
                     sid = item.get("input", "N/A")
                     if item.get("transcript_consequences"):
-                        cons = sorted(item["transcript_consequences"], key=lambda x: _SEVERITY.get(x.get("impact","MODIFIER"), 0), reverse=True)[0]
-                        results.append({"SNP": sid, "GENE": cons.get("gene_symbol","N/A"), "CONSEQUENCE": ", ".join(cons.get("consequence_terms",["N/A"])),
-                            "IMPACT": cons.get("impact","N/A"), "AMINO_ACID_CHANGE": cons.get("amino_acids","N/A")})
+                        cons = sorted(item["transcript_consequences"], key=lambda x: {"HIGH":4,"MODERATE":3,"LOW":2,"MODIFIER":1}.get(x.get("impact","MODIFIER"),0), reverse=True)[0]
+                        results.append({"SNP": sid, "GENE": cons.get("gene_symbol","N/A"), "CONSEQUENCE": ", ".join(cons.get("consequence_terms",["N/A"])), "IMPACT": cons.get("impact","N/A")})
                     else:
-                        results.append({"SNP": sid, "GENE": "Intergenic/Non-codant", "CONSEQUENCE": "N/A", "IMPACT": "MODIFIER", "AMINO_ACID_CHANGE": "N/A"})
+                        results.append({"SNP": sid, "GENE": "Intergenic", "CONSEQUENCE": "N/A", "IMPACT": "MODIFIER"})
+            else:
+                st.error(f"Erreur API Ensembl (Code {r.status_code}) : {r.text}")
         except Exception as e: st.warning(f"⚠️ VEP réseau: {e}")
         time.sleep(1.0)
     return pd.DataFrame(results)
 
-def fetch_uniprot_id(gene_name, taxon="9838"):
-    q = f"gene:{gene_name} AND organism_id:{taxon}"
-    url = f"https://rest.uniprot.org/uniprotkb/search?query={quote(q)}&format=json&size=1"
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("results"): return data["results"][0].get("primaryAccession")
-    except Exception: pass
-    return None
-
-def fetch_alphafold_pdb(uniprot_id):
-    url = f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
-            for rec in r.json():
-                if rec.get("uniprotAccession") == uniprot_id:
-                    pdb_url = rec.get("pdbUrl")
-                    if pdb_url:
-                        pr = requests.get(pdb_url, timeout=30)
-                        if pr.status_code == 200: return pr.text
-    except Exception: pass
-    return None
-
-def render_3d_structure(pdb_data, style="cartoon", color_scheme="spectrum", highlight_res=None):
-    style_json = json.dumps({style: {'color': color_scheme}}); pdb_json = json.dumps(pdb_data); hl_js = ""
-    if highlight_res and str(highlight_res).strip().isdigit(): hl_js = f"viewer.addStyle({{resi: '{highlight_res}'}}, {{stick: {{colorscheme: 'redCarbon'}}}});"
-    html_code = f"""
-    <div id="viewport" style="width: 100%; height: 500px; position: relative;"></div>
-    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
-    <script>
-        let element = document.getElementById("viewport");
-        let viewer = $3Dmol.createViewer(element, {{ backgroundColor: 'white' }});
-        viewer.addModel({pdb_json}, "pdb");
-        viewer.setStyle({{}}, {style_json});
-        {hl_js}
-        viewer.zoomTo(); viewer.render();
-    </script>"""
-    components.html(html_code, height=520)
-
 # ============================================================
 # VISUALISATIONS
 # ============================================================
-def plot_missing(mi, ms):
-    f = make_subplots(rows=1, cols=2, subplot_titles=("Missing/Ind","Missing/SNP"))
-    f.add_trace(go.Histogram(x=mi, nbinsx=60, marker_color="skyblue"), 1, 1)
-    f.add_trace(go.Histogram(x=ms, nbinsx=60, marker_color="coral"), 1, 2)
-    f.update_layout(height=400, showlegend=False); return f
 def plot_pca(s, v, l):
     f = px.scatter(pd.DataFrame({"PC1":s[:,0],"PC2":s[:,1],"Pop":l}), x="PC1", y="PC2", color="Pop", title=f"PCA PC1({v[0]:.1f}%) vs PC2({v[1]:.1f}%)", height=550)
     f.update_traces(marker=dict(size=10, line=dict(width=1, color="white"))); return f
@@ -551,10 +423,6 @@ def plot_manhattan(df, yc="P", title="", thr=None):
         fig.add_trace(go.Scatter(x=sub.index, y=sub[yc], mode="markers", marker=dict(size=5, color="#2c3e50" if i%2==0 else "#7f8c8d"), text=sub["SNP"], hoverinfo="text", showlegend=False))
     if thr: fig.add_hline(y=thr, line_dash="dash", line_color="red")
     fig.update_layout(title=title, xaxis_title="Chr", yaxis_title=yc, height=500); return fig
-def plot_ld(ld, b=20):
-    if ld is None or ld.empty: return None
-    d = ld.copy(); d["bin"] = (d["dist_kb"]//b)*b
-    return px.line(d.groupby("bin")["r2"].mean().reset_index(), x="bin", y="r2", title="LD decay", height=450)
 def plot_admix(Q, labs, pops, K):
     df = pd.DataFrame(Q, columns=[f"K{k+1}" for k in range(K)]); df["IID"] = labs; df["Pop"] = pops
     df["_d"] = Q.argmax(1); df["_po"] = pd.Categorical(pops, categories=sorted(set(pops)))
@@ -575,19 +443,20 @@ def plot_win_manh(df, vc='MEAN_FST', title="", sigma=3.0):
 # ============================================================
 # STREAMLIT APP
 # ============================================================
-_KEYS = ["gt","ind_df","snp_df","gt_filt","ind_filt","snp_filt","qc_stats","pop_stats","pca_s","pca_v","gt_pruned","snp_pruned","admix_Q","admix_K","ld_df","roh_df","froh","win_fst","taj_df","css_df","vep_res"]
+_KEYS = ["gt","ind_df","snp_df","gt_filt","ind_filt","snp_filt","pop_stats","pca_s","pca_v","gt_pruned","snp_pruned","admix_Q","admix_K","roh_df","froh","win_fst","taj_df","css_df","vep_res","vep_snps"]
 def init_state():
     for k in _KEYS:
         if k not in st.session_state: st.session_state[k] = None
 
 def main():
     init_state()
-    st.title("🐪 Dromedary Genomics Pipeline v1.3")
+    st.title("🐪 Dromedary Genomics Pipeline v1.4")
     st.caption("Projet Algérie : Adaptation au désert & Signatures de Sélection")
 
     with st.sidebar:
         st.header("📁 Données")
-        mode = st.radio("Source", ["Demo","PED/MAP","VCF"], key="src")
+        # 🌟 ONGLET DE CONVERSION RÉINTÉGRÉ
+        mode = st.radio("Source", ["PED/MAP", "Axiom→PED", "VCF"], key="src")
         
         if mode == "PED/MAP":
             ped = st.file_uploader(".ped", type=["ped","gz"]); mp = st.file_uploader(".map", type=["map","gz"])
@@ -602,6 +471,20 @@ def main():
                     st.success(f"✅ {gt.shape[0]} échantillons × {gt.shape[1]} SNPs")
                 except Exception as e: st.error(f"❌ {e}")
                 
+        elif mode == "Axiom→PED":
+            af = st.file_uploader("Axiom brut", type=["txt","csv","tsv","gz","ped"])
+            if af and st.button("🔄 Convertir"):
+                try:
+                    s, g, ns = parse_axiom(af.read(), af.name)
+                    mpl = [f"1\tSNP_{i+1:06d}\t0\t{i+1}" for i in range(ns)]
+                    pdl = ["\t".join([sample_fid_iid(smp)[0], sample_fid_iid(smp)[1], "0","0","0","-9"] + [a for pr in row for a in pr]) for smp, row in zip(s, g)]
+                    st.session_state["_plink_ped"] = "\n".join(pdl)+"\n"; st.session_state["_plink_map"] = "\n".join(mpl)+"\n"
+                    st.success(f"✅ {len(s)}×{ns} converti.")
+                except Exception as e: st.error(f"❌ {e}")
+            if st.session_state.get("_plink_ped"):
+                st.download_button("⬇ .ped", st.session_state["_plink_ped"].encode(), "out.ped")
+                st.download_button("⬇ .map", st.session_state["_plink_map"].encode(), "out.map")
+
         elif mode == "VCF":
             vf = st.file_uploader(".vcf", type=["vcf","gz"])
             if vf and st.button("📥 Charger"):
@@ -621,28 +504,20 @@ def main():
         ld_r2 = st.slider("LD r²", 0.05, 0.5, 0.2, 0.05)
 
     if st.session_state.gt is None:
-        st.info("👉 Chargez vos fichiers PED et MAP pour commencer l'analyse.")
+        st.info("👉 Chargez vos fichiers pour commencer l'analyse.")
         return
 
-    tabs = st.tabs([
-        "🧹 QC", "📝 Tableau 1 (Stats)", "✂️ LD", "🧬 Structure", "🎨 Admixture", 
-        "📈 Démographie (ROH)", "🔥 Signatures de Sélection", "🧬 VEP (Gènes)", "🧬 AlphaFold 3D"
-    ])
+    tabs = st.tabs(["🧹 QC", "📝 Tableau 1 (Stats)", "✂️ LD", "🧬 Structure", "🎨 Admixture", "📈 Démographie (ROH)", "🔥 Signatures de Sélection", "🧬 VEP (Gènes)"])
 
     # ═══════ QC ═══════
     with tabs[0]:
         if st.button("▶ Lancer QC", type="primary", key="qc_btn"):
             try:
                 p = {"geno":geno, "mind":mind, "maf":maf_t, "hwe":hwe_t, "het_sd":het_sd}
-                gf, inf, snf, gp, ip, sp, qs = apply_qc(st.session_state.gt, st.session_state.ind_df, st.session_state.snp_df, p, rem_out=rem_out, autosomal_only=auto_only)
-                st.session_state.update({"gt_filt":gf, "ind_filt":inf, "snp_filt":snf, "qc_stats":qs})
+                gf, inf, snf = apply_qc(st.session_state.gt, st.session_state.ind_df, st.session_state.snp_df, p, rem_out=rem_out, autosomal_only=auto_only)
+                st.session_state.update({"gt_filt":gf, "ind_filt":inf, "snp_filt":snf})
                 st.success(f"✅ QC terminé : {gf.shape[0]} individus × {gf.shape[1]} SNPs retenus.")
             except Exception as e: st.error(f"❌ {e}")
-        if st.session_state.qc_stats:
-            s = st.session_state.qc_stats
-            c1, c2 = st.columns(2)
-            c1.metric("Individus retenus", s["n_ind_final"], delta=-s["excluded_ind"])
-            c2.metric("SNPs retenus", s["n_snp_final"], delta=-s["excluded_snp"])
 
     # ═══════ TABLEAU 1 ═══════
     with tabs[1]:
@@ -652,11 +527,6 @@ def main():
                 df_stats = compute_pop_stats(st.session_state.gt_filt, st.session_state.ind_filt)
                 st.session_state.pop_stats = df_stats
                 st.dataframe(df_stats, use_container_width=True)
-                mean_F = df_stats["F_mean"].mean()
-                if mean_F < 0:
-                    st.success(f"💡 **Interprétation :** Moyenne F = {mean_F:.3f}. Valeur négative = excès d'hétérozygotes (absence de consanguinité, fort brassage).")
-                else:
-                    st.warning(f"💡 **Interprétation :** Moyenne F = {mean_F:.3f}. Valeur positive = consanguinité.")
         else: st.warning("⚠️ Lancez d'abord le QC.")
 
     # ═══════ LD ═══════
@@ -665,11 +535,6 @@ def main():
             k = ld_pruning(st.session_state.gt_filt, 50, 5, ld_r2)
             st.session_state.update({"gt_pruned":st.session_state.gt_filt[:,k], "snp_pruned":st.session_state.snp_filt[k].reset_index(drop=True)})
             st.success(f"✅ {st.session_state.gt_pruned.shape[1]} SNPs retenus.")
-        if st.session_state.gt_pruned is not None:
-            if st.button("▶ LD Decay", key="ld_decay_btn"):
-                st.session_state.ld_df = ld_decay(st.session_state.gt_pruned, st.session_state.snp_pruned["BP"].values)
-            if st.session_state.ld_df is not None:
-                st.plotly_chart(plot_ld(st.session_state.ld_df), use_container_width=True)
 
     # ═══════ STRUCTURE ═══════
     with tabs[3]:
@@ -701,45 +566,30 @@ def main():
             st.success(f"✅ {len(roh)} ROH trouvés.")
         if st.session_state.froh is not None:
             df = pd.DataFrame({"FROH": st.session_state.froh, "Pop": st.session_state.ind_filt["FID"].values})
-            st.plotly_chart(px.histogram(df, x="FROH", color="Pop", title="Distribution FROH (0 = pas de consanguinité)"), use_container_width=True)
+            st.plotly_chart(px.histogram(df, x="FROH", color="Pop", title="Distribution FROH"), use_container_width=True)
 
-    # ═══════ SIGNATURES DE SÉLECTION (FST, TAJIMA, CSS) ═══════
+    # ═══════ SIGNATURES DE SÉLECTION ═══════
     with tabs[6]:
-        st.subheader("🔥 Signatures de Sélection (Adaptation au désert)")
-        st.markdown("Les balayages sélectifs (selective sweeps) se détectent par 3 méthodes complémentaires.")
-        
         if st.session_state.gt_pruned is not None:
             lab = st.session_state.ind_filt["FID"].astype(str).values
-            
-            # 1. FST
-            st.divider()
             st.markdown("### 1️⃣ Différenciation (FST)")
-            c1, c2 = st.columns(2)
-            w = c1.slider("Fenêtre FST", 10, 100, 50)
-            s = c2.slider("Pas FST", 5, 50, 25)
             if st.button("▶ Scanner FST", key="fst_btn"):
                 with st.spinner("Calcul FST..."):
-                    win = windowed_fst(st.session_state.gt_pruned, st.session_state.snp_pruned, lab, w, s, use_wc84=True)
+                    win = windowed_fst(st.session_state.gt_pruned, st.session_state.snp_pruned, lab, 50, 25, use_wc84=True)
                     st.session_state.win_fst = win
                 st.success("✅")
             if st.session_state.win_fst is not None:
                 st.plotly_chart(plot_win_manh(st.session_state.win_fst, 'MEAN_FST', 'Pics de différenciation (FST)'), use_container_width=True)
-                st.dataframe(st.session_state.win_fst.sort_values("MEAN_FST", ascending=False).head(5), use_container_width=True)
 
-            # 2. Tajima's D
             st.divider()
             st.markdown("### 2️⃣ Spectre de fréquences (Tajima's D)")
-            st.markdown("Un D < -2 indique une sélection positive ou une expansion récente.")
-            c1, c2 = st.columns(2)
-            tw = c1.slider("Fenêtre Tajima", 10, 50, 25)
-            ts = c2.slider("Pas Tajima", 5, 20, 10)
             if st.button("▶ Lancer Tajima's D", key="taj_btn"):
                 with st.spinner("Calcul Tajima..."):
                     res = []
                     for pop in np.unique(lab):
                         m = lab == pop
                         if m.sum() >= 5:
-                            t = tajimas_scan(st.session_state.gt_pruned[m], st.session_state.snp_pruned, tw, ts)
+                            t = tajimas_scan(st.session_state.gt_pruned[m], st.session_state.snp_pruned, 25, 10)
                             if not t.empty:
                                 t["Population"] = pop
                                 res.append(t)
@@ -749,76 +599,56 @@ def main():
                 fig = px.scatter(st.session_state.taj_df, x="MID", y="TAJIMA_D", color="Population", title="Tajima's D par fenêtre", hover_data=["CHR", "S"])
                 fig.add_hline(y=-2, line_dash="dash", line_color="red")
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(st.session_state.taj_df.sort_values("TAJIMA_D").head(5), use_container_width=True)
 
-            # 3. CSS (Composite Selection Score)
             st.divider()
             st.markdown("### 3️⃣ Score Composite (CSS)")
-            st.markdown("Combine la différenciation (FST) et la réduction de diversité (Homozygotie). Idéal pour trouver les gènes de survie.")
             if st.button("▶ Calculer le CSS", key="css_btn"):
                 with st.spinner("Calcul CSS..."):
                     css = composite_score(st.session_state.gt_pruned, st.session_state.snp_pruned, lab)
                     st.session_state.css_df = css
                 st.success("✅")
             if st.session_state.css_df is not None:
-                # On transforme le CSS en pseudo-pvalue pour le graphique Manhattan
                 df_css = st.session_state.css_df.copy()
                 df_css["P"] = np.exp(-df_css["CSS"])
                 st.plotly_chart(plot_manhattan(df_css, yc="P", title="Manhattan CSS (Pics = zones sous sélection)"), use_container_width=True)
-                st.dataframe(df_css.head(10), use_container_width=True)
-        else:
-            st.warning("⚠️ Lancez d'abord le LD Pruning.")
 
     # ═══════ VEP ═══════
     with tabs[7]:
         st.subheader("🧬 Annotation des gènes candidats (VEP)")
-        snps_vep = []
         
+        # Ajout de la saisie manuelle
+        st.markdown("**Saisie manuelle (Format: CHR:POS ou CHR:POS-END)**")
+        manual_input = st.text_area("Ex: 1:150000-150000\n2:200000-200000", height=100)
+        
+        snps_vep = []
         c1, c2, c3 = st.columns(3)
-        if st.session_state.win_fst is not None:
-            if c1.button("📥 Top 10 FST", key="load_vep_fst"):
-                snps_vep = st.session_state.win_fst.sort_values("MEAN_FST", ascending=False).head(10)["TOP_SNP"].tolist()
-                st.session_state.vep_snps = snps_vep
-        if st.session_state.taj_df is not None:
-            if c2.button("📥 Top 10 Tajima", key="load_vep_taj"):
-                top_taj = st.session_state.taj_df.sort_values("TAJIMA_D").head(10)
-                # Récupérer les SNPs (ici simplifié, on prend les régions)
-                snps_vep = top_taj.apply(lambda r: f"{r['CHR']}:{int(r['START'])}-{int(r['END'])}", axis=1).tolist()
-                st.session_state.vep_snps = snps_vep
-        if st.session_state.css_df is not None:
-            if c3.button("📥 Top 10 CSS", key="load_vep_css"):
-                snps_vep = st.session_state.css_df.head(10)["SNP"].tolist()
-                st.session_state.vep_snps = snps_vep
-                
+        if st.session_state.win_fst is not None and c1.button("📥 Top 10 FST", key="load_vep_fst"):
+            snps_vep = st.session_state.win_fst.sort_values("MEAN_FST", ascending=False).head(10)["TOP_SNP"].tolist()
+            st.session_state.vep_snps = snps_vep
+        if st.session_state.taj_df is not None and c2.button("📥 Top 10 Tajima", key="load_vep_taj"):
+            top_taj = st.session_state.taj_df.sort_values("TAJIMA_D").head(10)
+            snps_vep = top_taj.apply(lambda r: f"{str(r['CHR']).replace('chr','')}:{int(r['START'])}-{int(r['END'])}", axis=1).tolist()
+            st.session_state.vep_snps = snps_vep
+        if st.session_state.css_df is not None and c3.button("📥 Top 10 CSS", key="load_vep_css"):
+            snps_vep = st.session_state.css_df.head(10)["SNP"].tolist()
+            st.session_state.vep_snps = snps_vep
+            
+        if manual_input:
+            st.session_state.vep_snps = [line.strip() for line in manual_input.split("\n") if line.strip()]
+
         if st.session_state.get("vep_snps"):
-            st.info(f"SNPs chargés : {len(st.session_state.vep_snps)}")
+            st.info(f"🧬 Requête VEP : {st.session_state.vep_snps}")
+            
             if st.button("🔬 Lancer VEP (Dromadaire)", type="primary"):
-                with st.spinner("Interrogation Ensembl (Camelus dromedarius)..."):
+                with st.spinner("Interrogation Ensembl..."):
                     res = run_vep_api(st.session_state.vep_snps)
                     if not res.empty:
-                        res["LOCALISATION"] = res["CONSEQUENCE"].apply(traduction_consequence_vep)
                         st.session_state.vep_res = res
-                st.success("✅")
-                st.dataframe(res, use_container_width=True)
-                st.download_button("⬇ Télécharger pour l'article", res.to_csv(index=False).encode(), "vep_genes.csv")
-
-    # ═══════ 3D ═══════
-    with tabs[8]:
-        st.subheader("🧬 AlphaFold — Visualisation 3D")
-        genes_to_structure = []
-        if st.session_state.get("vep_res") is not None and "GENE" in st.session_state.vep_res.columns:
-            genes_to_structure = [g for g in st.session_state.vep_res["GENE"].unique() if str(g).strip() not in ("N/A","Intergenic/Non-codant","Unknown","nan","")]
-        if not genes_to_structure: st.warning("⚠️ Lancez d'abord VEP pour obtenir des gènes.")
-        else:
-            target_gene = st.selectbox("Gène", genes_to_structure)
-            if st.button("🔬 Charger 3D", type="primary"):
-                with st.spinner(f"Recherche UniProt pour {target_gene}..."):
-                    uid = fetch_uniprot_id(target_gene, taxon="9838")
-                    if uid:
-                        st.success(f"✅ UniProt: {uid}"); pdb = fetch_alphafold_pdb(uid)
-                        if pdb: render_3d_structure(pdb)
-                        else: st.error("❌ AlphaFold introuvable.")
-                    else: st.error("❌ Gène non trouvé.")
+                        st.success("✅ Résultats obtenus.")
+                    else:
+                        st.warning("⚠️ Ensembl n'a renvoyé aucun résultat. Vérifiez que les coordonnées sont correctes.")
+            if st.session_state.vep_res is not None and not st.session_state.vep_res.empty:
+                st.dataframe(st.session_state.vep_res, use_container_width=True)
 
 if __name__ == "__main__":
     main()
