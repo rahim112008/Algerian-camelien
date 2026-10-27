@@ -1,4 +1,4 @@
-"""🧬 Universal Livestock Genomics Pipeline v23.3 (Bovin & Camelin)"""
+"""🧬 Universal Livestock Genomics Pipeline v23.4 (Bovin & Camelin)"""
 import gzip, io, os, warnings, zipfile, gc
 from collections import Counter
 from io import BytesIO
@@ -36,7 +36,7 @@ except ImportError:
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🧬 Universal Genomics v23.3", page_icon="🧬",
+st.set_page_config(page_title="🧬 Universal Genomics v23.4", page_icon="🧬",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
@@ -478,13 +478,11 @@ def detect_roh(gt, snp_json, min_snps=30, min_kb=500.0):
 
 @cache_data
 def fst_pairwise(gt, labels, use_wc84=False):
-    # CORRECTION : s'assurer que labels est un numpy array
     labels = np.asarray(labels).astype(str)
     pops = sorted(np.unique(labels)); K = len(pops); M = np.full((K, K), np.nan); np.fill_diagonal(M, 0.0)
     masks = {p: (labels == p) for p in pops}
     for i in range(K):
         for j in range(i+1, K):
-            # CORRECTION : Utilisation de np.logical_or
             sub_mask = np.logical_or(masks[pops[i]], masks[pops[j]])
             sub = gt[sub_mask]
             sub_lab = labels[sub_mask]
@@ -805,6 +803,7 @@ def permutation_test_race(gt, snp_df, labels, ra, rb, n_perm=100, seed=42, max_s
     return original, float(p_emp), n_obs, perm_counts
 
 _SEVERITY = {"HIGH": 4, "MODERATE": 3, "LOW": 2, "MODIFIER": 1}
+
 def traduire_consequence_vep(c):
     c = str(c).lower()
     if "missense" in c: return "🔴 Exon (Faux-sens - Protéine modifiée)"
@@ -1157,7 +1156,7 @@ def main():
 
     if st.session_state.gt is None: st.info(f"👉 Chargez des données pour {species_choice} (Demo recommandé)."); return
 
-    st.title(f"🐾 {species_choice} Genomics Pipeline v23.3")
+    st.title(f"🐾 {species_choice} Genomics Pipeline v23.4")
 
     tabs = st.tabs(["🧹 QC", "✂️ LD", "🧬 Structure", "🎨 Admixture", "📈 Démographie", "🔍 Sélection", "🧪 GWAS Classique", "🎯 Post-GWAS", "📈 GBLUP", "🧬 Annotation", "🧬 VEP & NCBI", "🧬 Structure 3D", "🧬 Alignement", "📤 Export", "🔬 Méta-analyse", "🧠 ML", "🧬 Haplotypes", "🌍 LiftOver"])
 
@@ -1430,7 +1429,7 @@ def main():
             if st.button("🔬 Lancer VEP", type="primary", key="run_vep_btn"):
                 with st.spinner("Interrogation Ensembl VEP..."):
                     vep_res = run_vep_api(vep_input, VEP_SPECIES)
-                    if not vep_res.empty: vep_res["LOCALISATION"] = vep_res["CONSEQUENCE"].apply(traduce_consequence_vep); st.session_state.vep_res = vep_res; st.success("✅ VEP terminé.")
+                    if not vep_res.empty: vep_res["LOCALISATION"] = vep_res["CONSEQUENCE"].apply(traduire_consequence_vep); st.session_state.vep_res = vep_res; st.success("✅ VEP terminé.")
             if st.session_state.get("vep_res") is not None and not st.session_state.vep_res.empty:
                 st.dataframe(st.session_state.vep_res[["SNP","GENE","LOCALISATION","CONSEQUENCE","IMPACT","AMINO_ACID_CHANGE"]], use_container_width=True); st.download_button("⬇ CSV VEP", st.session_state.vep_res.to_csv(index=False).encode(), "vep_results.csv", "text/csv")
             st.markdown("### NCBI Gene"); genes_to_fetch = []
