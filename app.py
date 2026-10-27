@@ -1,4 +1,4 @@
-"""🧬 Universal Livestock Genomics Pipeline v23.0 (Bovin & Camelin)"""
+"""🧬 Universal Livestock Genomics Pipeline v23.1 (Bovin & Camelin)"""
 import gzip, io, os, warnings, zipfile, gc
 from collections import Counter
 from io import BytesIO
@@ -36,7 +36,7 @@ except ImportError:
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🧬 Universal Genomics v23.0", page_icon="🧬",
+st.set_page_config(page_title="🧬 Universal Genomics v23.1", page_icon="🧬",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
@@ -463,7 +463,7 @@ def ld_decay(gt, snp_df, max_kb=1000, max_snp=3000):
     if not distances: return pd.DataFrame(columns=["dist_kb","r2","count"])
     df = pd.DataFrame({"dist_kb": distances, "r2": r2_vals})
     bins = np.linspace(0, max_kb, 30); df["bin"] = pd.cut(df["dist_kb"], bins=bins, labels=False, include_lowest=True)
-    res = df.groupby("bin").agg(dist_kb=("dist_kb", "mean"), r2=("r2", "mean"), count=("r2", "count")).dropna().sort_values("dist_kb")
+    res = df.groupby("bin").agg(dist_kb=("dist_kb", "mean"), r2=("r2", "mean"), count=("r2", "count")).dropna().sort_values("dist_kb").reset_index(drop=True)
     return res
 
 @cache_data
@@ -1172,7 +1172,9 @@ def plot_manhattan(df, yc="P", title="", thr=None):
     fig.update_layout(title=title, xaxis_title="Chr", yaxis_title=yc, height=500); return fig
 def plot_ld(ld, b=20):
     if ld is None or ld.empty: return None
-    d = ld.copy(); d["bin"] = (d["dist_kb"]//b)*b
+    d = ld.copy()
+    if "bin" in d.columns: d = d.drop(columns=["bin"])
+    d["bin"] = (d["dist_kb"]//b)*b
     return px.line(d.groupby("bin")["r2"].mean().reset_index(), x="bin", y="r2", title="LD decay", height=450)
 def plot_admix(Q, labs, pops, K):
     df = pd.DataFrame(Q, columns=[f"K{k+1}" for k in range(K)]); df["IID"] = labs; df["Pop"] = pops
@@ -1300,7 +1302,7 @@ def main():
     if st.session_state.gt is None:
         st.info(f"👉 Chargez des données pour {species_choice} (Demo recommandé)."); return
 
-    st.title(f"🐾 {species_choice} Genomics Pipeline v23.0")
+    st.title(f"🐾 {species_choice} Genomics Pipeline v23.1")
 
     tabs = st.tabs([
         "🧹 QC", "✂️ LD", "🧬 Structure", "🎨 Admixture", "📈 Démographie",
