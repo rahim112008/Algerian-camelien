@@ -1,4 +1,4 @@
-"""🧬 Universal Livestock Genomics Pipeline v23.2 (Bovin & Camelin)"""
+"""🧬 Universal Livestock Genomics Pipeline v23.3 (Bovin & Camelin)"""
 import gzip, io, os, warnings, zipfile, gc
 from collections import Counter
 from io import BytesIO
@@ -36,7 +36,7 @@ except ImportError:
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🧬 Universal Genomics v23.2", page_icon="🧬",
+st.set_page_config(page_title="🧬 Universal Genomics v23.3", page_icon="🧬",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
@@ -333,7 +333,7 @@ def apply_qc(gt, ind_df, snp_df, params, autosomes, keep_autosomes=True, rem_out
     return gt,ind_df,snp_df,gt_pre,ind_pre,snp_pre,{"n_ind_init":int(n0),"n_snp_init":int(m0),"n_ind_final":int(gt.shape[0]),"n_snp_final":int(gt.shape[1]),"excluded_ind":int(n0-gt.shape[0]),"excluded_snp":int(m0-gt.shape[1]),"trace":tr}
 
 # ============================================================
-# ALGORITHMES (CORRIGÉS)
+# ALGORITHMES
 # ============================================================
 @cache_data
 def fst_snp_wc(gt, labels):
@@ -478,12 +478,14 @@ def detect_roh(gt, snp_json, min_snps=30, min_kb=500.0):
 
 @cache_data
 def fst_pairwise(gt, labels, use_wc84=False):
+    # CORRECTION : s'assurer que labels est un numpy array
+    labels = np.asarray(labels).astype(str)
     pops = sorted(np.unique(labels)); K = len(pops); M = np.full((K, K), np.nan); np.fill_diagonal(M, 0.0)
     masks = {p: (labels == p) for p in pops}
     for i in range(K):
         for j in range(i+1, K):
-            # CORRECTION ICI : Utilisation de masks[pops[j]] au lieu de labels[pops[j]]
-            sub_mask = masks[pops[i]] | masks[pops[j]]
+            # CORRECTION : Utilisation de np.logical_or
+            sub_mask = np.logical_or(masks[pops[i]], masks[pops[j]])
             sub = gt[sub_mask]
             sub_lab = labels[sub_mask]
             if use_wc84:
@@ -554,6 +556,7 @@ def composite_score(gt, snp_df, labels):
 
 @cache_data
 def reynolds(gt, labels):
+    labels = np.asarray(labels).astype(str)
     pops=sorted(np.unique(labels)); K=len(pops); ph={p:np.nanmean(gt[labels==p],0)/2.0 for p in pops}; D=np.zeros((K,K))
     for i in range(K):
         for j in range(i+1,K):
@@ -1154,7 +1157,7 @@ def main():
 
     if st.session_state.gt is None: st.info(f"👉 Chargez des données pour {species_choice} (Demo recommandé)."); return
 
-    st.title(f"🐾 {species_choice} Genomics Pipeline v23.2")
+    st.title(f"🐾 {species_choice} Genomics Pipeline v23.3")
 
     tabs = st.tabs(["🧹 QC", "✂️ LD", "🧬 Structure", "🎨 Admixture", "📈 Démographie", "🔍 Sélection", "🧪 GWAS Classique", "🎯 Post-GWAS", "📈 GBLUP", "🧬 Annotation", "🧬 VEP & NCBI", "🧬 Structure 3D", "🧬 Alignement", "📤 Export", "🔬 Méta-analyse", "🧠 ML", "🧬 Haplotypes", "🌍 LiftOver"])
 
@@ -1427,7 +1430,7 @@ def main():
             if st.button("🔬 Lancer VEP", type="primary", key="run_vep_btn"):
                 with st.spinner("Interrogation Ensembl VEP..."):
                     vep_res = run_vep_api(vep_input, VEP_SPECIES)
-                    if not vep_res.empty: vep_res["LOCALISATION"] = vep_res["CONSEQUENCE"].apply(traduire_consequence_vep); st.session_state.vep_res = vep_res; st.success("✅ VEP terminé.")
+                    if not vep_res.empty: vep_res["LOCALISATION"] = vep_res["CONSEQUENCE"].apply(traduce_consequence_vep); st.session_state.vep_res = vep_res; st.success("✅ VEP terminé.")
             if st.session_state.get("vep_res") is not None and not st.session_state.vep_res.empty:
                 st.dataframe(st.session_state.vep_res[["SNP","GENE","LOCALISATION","CONSEQUENCE","IMPACT","AMINO_ACID_CHANGE"]], use_container_width=True); st.download_button("⬇ CSV VEP", st.session_state.vep_res.to_csv(index=False).encode(), "vep_results.csv", "text/csv")
             st.markdown("### NCBI Gene"); genes_to_fetch = []
