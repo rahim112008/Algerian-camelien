@@ -367,6 +367,41 @@ def mds_analysis(gt, nc=5):
     for i in range(n): D[i]=np.abs(X-X[i]).sum(1)/X.shape[1]
     return SklearnMDS(n_components=nc,dissimilarity="precomputed",random_state=42,n_init=1,max_iter=300,normalized_stress=False).fit_transform(D)
 
+# --- FONCTION DIVERSITÉ (AJOUT) ---
+@st.cache_data(show_spinner=False)
+def compute_diversity(_gt, _labels, hash_key):
+    pops = np.unique(_labels)
+    results = []
+    for p in pops:
+        sub_gt = _gt[_labels == p]
+        if sub_gt.shape[0] < 3: continue
+        
+        freqs = np.nanmean(sub_gt, axis=0) / 2.0
+        valid_freqs = freqs[~np.isnan(freqs)]
+        if len(valid_freqs) == 0: continue
+        
+        he = np.mean(2 * valid_freqs * (1 - valid_freqs))
+        ho = np.nanmean(sub_gt == 1)
+        fis = 1 - (ho / he) if he > 0 else 0
+        
+        q = 1 - valid_freqs
+        pic = np.mean(1 - (valid_freqs**2 + q**2) - 2 * (valid_freqs**2) * (q**2))
+        
+        maf_mean = np.mean(np.minimum(valid_freqs, 1 - valid_freqs))
+        n_poly = np.sum((valid_freqs > 0) & (valid_freqs < 1))
+        
+        results.append({
+            "Population": p, 
+            "H_Observee (Ho)": round(ho, 4), 
+            "H_Attendue (He)": round(he, 4), 
+            "Fis (Consanguinité)": round(fis, 4),
+            "PIC": round(pic, 4), 
+            "MAF_moyenne": round(maf_mean, 4),
+            "SNPs_Polymorphes": int(n_poly)
+        })
+    return pd.DataFrame(results)
+# ------------------------------------
+
 @cache_data
 def king_mat(gt):
     h = np.nansum(gt == 1, axis=1).astype(np.float64); H = (gt == 1).astype(np.float32); BH = H @ H.T; d = h[:, None] + h[None, :]
@@ -1188,6 +1223,40 @@ def main():
         if st.session_state.pca_s is not None:
             st.plotly_chart(plot_pca(st.session_state.pca_s, st.session_state.pca_v, st.session_state.ind_filt["FID"].values), use_container_width=True, key="plot_pca_tab"); st.plotly_chart(plot_mds(st.session_state.mds_c, st.session_state.ind_filt["FID"].values), use_container_width=True, key="plot_mds_tab")
 
+        # --- PARTIE DIVERSITÉ (AJOUT) ---
+        st.divider()
+        st.subheader("📊 Indices de Diversité Génétique (Ho, He, PIC, Fis)")
+        st.markdown("Calcul des indices standards de génétique des populations (Nei, 1973 ; Botstein et al., 1980).")
+        if st.button("Calculer la Diversité", type="primary"):
+            try:
+                gu = st.session_state.gt_pruned if st.session_state.gt_pruned is not None else st.session_state.gt_filt
+                labs = st.session_state.ind_filt["FID"].astype(str).values
+                with st.spinner("Calcul des indices..."):
+                    div_df = compute_diversity(gu, labs, "div_key")
+                
+                st.dataframe(div_df, use_container_width=True)
+                st.download_button(
+                    label="⬇ Télécharger le tableau (CSV)",
+                    data=div_df.to_csv(index=False).encode('utf-8'),
+                    file_name='tableau_diversite.csv',
+                    mime='text/csv',
+                )
+                
+                fig_div = px.bar(
+                    div_df, 
+                    x="Population", 
+                    y=["H_Observee (Ho)", "H_Attendue (He)"], 
+                    barmode="group", 
+                    title="Hétérozygotie Observée vs Attendue par Population",
+                    labels={"value": "Hétérozygotie", "variable": "Type"}
+                )
+                st.plotly_chart(fig_div, use_container_width=True)
+                
+                st.info(f"**Moyennes globales :** He = {div_df['H_Attendue (He)'].mean():.4f} | Ho = {div_df['H_Observee (Ho)'].mean():.4f} | PIC = {div_df['PIC'].mean():.4f} | Fis = {div_df['Fis (Consanguinité)'].mean():.4f}")
+            except Exception as e:
+                st.error(f"❌ Erreur lors du calcul : {e}")
+        # -----------------------------------
+
     with tabs[3]:
         if st.session_state.gt_filt is not None:
             st.subheader("📊 Choix de K par courbe d'erreur NMF"); c1, c2 = st.columns(2); kmin = c1.slider("K min", 2, 5, 2, key="kmin_sl"); kmax = c2.slider("K max", 4, 10, 8, key="kmax_sl")
@@ -1214,6 +1283,22 @@ def main():
             except Exception as e: st.error(f"❌ {e}")
         if st.session_state.froh is not None:
             df = pd.DataFrame({"FROH": st.session_state.froh, "Pop": st.session_state.ind_filt["FID"].values}); st.plotly_chart(px.histogram(df, x="FROH", color="Pop", nbins=50, title="FROH"), use_container_width=True, key="plot_roh_hist")
+            
+            # --- ROH PAR CLASSES (AJOUT) ---
+            if st.session_state.roh_df is not None and not st.session_state.roh_df.empty:
+                st.markdown("### 📏 ROH par classes de taille")
+                roh_df = st.session_state.roh_df
+                tot_len_kb = sum([cfg["ars"][c] for c in cfg["autosomes"]]) * 1000
+                
+                col1, col2, col3 = st.columns(3)
+                froh_15 = roh_df[roh_df["length_kb"] > 1500]["length_kb"].sum() / tot_len_kb
+                froh_5 = roh_df[roh_df["length_kb"] > 5000]["length_kb"].sum() / tot_len_kb
+                froh_10 = roh_df[roh_df["length_kb"] > 10000]["length_kb"].sum() / tot_len_kb
+                
+                col1.metric("FROH > 1.5 Mb (Ancien)", f"{froh_15:.4f}")
+                col2.metric("FROH > 5 Mb (Récent)", f"{froh_5:.4f}")
+                col3.metric("FROH > 10 Mb (Très récent)", f"{froh_10:.4f}")
+            # -------------------------------
 
     with tabs[5]:
         st.subheader("🔍 Sélection & structure des populations"); use_wc = st.checkbox("Utiliser Weir & Cockerham (1984) — recommandé", value=True, key="use_wc84")
