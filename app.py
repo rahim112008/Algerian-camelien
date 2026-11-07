@@ -256,6 +256,101 @@ def parse_axiom(raw_bytes, fn=""):
     for i, r in enumerate(gtypes): gtypes[i] = r[:c] + [("0", "0")] * (c - len(r))
     return samples, gtypes, c
 
+# ============================================================
+# RÉPARATION DE PED CORROMPU (v23.7)
+# ============================================================
+def repair_ped_streaming(raw_bytes):
+    """Répare un PED corrompu (lignes de longueurs variables, tokens parasites). 
+    Extrait le breed depuis le FID. Retourne (cleaned_bytes, report_dict)."""
+    import re
+    raw = gzip.decompress(raw_bytes) if (len(raw_bytes) >= 2 and raw_bytes[:2] == b"\x1f\x8b") else raw_bytes
+    text = raw.decode("utf-8", errors="replace")
+    lines_in = text.splitlines()
+    del text
+
+    def is_valid_allele(t):
+        return t in ("A", "C", "G", "T", "a", "c", "g", "t", "0", "N")
+
+    def find_geno_start(tokens, min_run=10):
+        for i in range(len(tokens) - min_run):
+            if all(is_valid_allele(t) for t in tokens[i:i + min_run]):
+                return i
+        return None
+
+    def extract_breed(cel_name):
+        clean = cel_name.replace(".CEL", "").replace(".cel", "")
+        clean = re.sub(r"\([^)]*\)", "", clean)
+        parts = [p for p in clean.split("_") if p]
+        if not parts:
+            return "UNKNOWN"
+        if parts[0].upper() == "DZA" and len(parts) >= 2:
+            breed = parts[1].upper()
+        else:
+            breed = parts[0].upper()
+        breed = re.sub(r"[^A-Z0-9]", "_", breed)
+        return breed.strip("_") or "UNKNOWN"
+
+    n_total = n_kept = n_fixed = n_errors = 0
+    breeds = {}
+    out_lines = []
+    issues = []
+
+    for line in lines_in:
+        if not line.strip():
+            continue
+        n_total += 1
+        tokens = line.split()
+        if not tokens:
+            continue
+
+        fid_raw = tokens[0]
+        iid_raw = tokens[1] if len(tokens) > 1 else fid_raw
+
+        normal = (len(tokens) >= 6 and
+                  all(tokens[j] in ("0", "1", "-9", "1.0", "0.0") or
+                      tokens[j].lstrip("-").replace(".", "").isdigit()
+                      for j in range(2, 6)))
+
+        if normal and is_valid_allele(tokens[6]) and is_valid_allele(tokens[7]):
+            new_tokens = tokens
+            n_kept += 1
+        else:
+            start = find_geno_start(tokens[2:])
+            if start is None:
+                issues.append(f"L{n_total}: génotypes introuvables")
+                n_errors += 1
+                continue
+            start += 2
+            genotypes = tokens[start:]
+            new_tokens = [fid_raw, iid_raw, "0", "0", "0", "-9"] + genotypes
+            n_fixed += 1
+
+        breed = extract_breed(fid_raw)
+        breeds[breed] = breeds.get(breed, 0) + 1
+        out_lines.append("\t".join([breed, iid_raw] + new_tokens[2:]))
+
+    cleaned = ("\n".join(out_lines) + "\n").encode("utf-8")
+
+    lens = set()
+    for line in out_lines[:500]:
+        lens.add(len(line.split("\t")) if "\t" in line else len(line.split()))
+    allele_sample = {}
+    for line in out_lines[:50]:
+        toks = line.split("\t") if "\t" in line else line.split()
+        for a in toks[6:106]:
+            allele_sample[a] = allele_sample.get(a, 0) + 1
+
+    report = {
+        "n_total": n_total, "n_kept": n_kept, "n_fixed": n_fixed, "n_errors": n_errors,
+        "issues": issues[:10],
+        "breeds": dict(sorted(breeds.items(), key=lambda x: -x[1])),
+        "n_breeds": len(breeds),
+        "line_lengths": sorted(lens), "coherent": len(lens) == 1,
+        "alleles_sample": allele_sample,
+        "alleles_valid": set(allele_sample.keys()).issubset({"A", "C", "G", "T", "0", "N"}),
+    }
+    return cleaned, report
+
 # ✅ NOUVEAU : parse_map universel (multi-format)
 def parse_map(b):
     """Parseur MAP universel : gère PLINK standard, 3 colonnes, colonnes inversées, en-tête, séparateurs variés."""
