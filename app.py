@@ -1,5 +1,5 @@
 """🧬 Universal Livestock Genomics Pipeline v23.7 (Bovin & Camelin) — stats pour publication"""
-import gzip, io, warnings, zipfile, gc, hashlib, json, time
+import gzip, io, warnings, zipfile, gc, hashlib, json, time, re
 from collections import Counter
 from io import BytesIO
 from urllib.parse import quote
@@ -139,10 +139,17 @@ def _sample_blocks(n, max_snp, block=200, seed=42):
     return np.concatenate([np.arange(b * block, min((b + 1) * block, n)) for b in ch])
 
 # ============================================================
-# DIAGNOSTIC & AUTO-DÉTECTION DES FICHIERS BRUTS (NOUVEAU)
+# DIAGNOSTIC & RÉPARATION DES FICHIERS BRUTS
 # ============================================================
+MAX_FILE_MB = 500
+
+def check_file_size(raw_bytes, name="fichier", max_mb=MAX_FILE_MB):
+    size_mb = len(raw_bytes) / 1e6
+    if size_mb > max_mb:
+        return False, size_mb, f"❌ {name} = {size_mb:.1f} MB > {max_mb} MB"
+    return True, size_mb, f"✅ {name} = {size_mb:.1f} MB"
+
 def _split_line(line):
-    """Découpe une ligne quel que soit le séparateur (tab, comma, espaces)."""
     if "\t" in line:
         return [x.strip() for x in line.split("\t") if x.strip()]
     if "," in line and line.count(",") > line.count(" "):
@@ -150,7 +157,6 @@ def _split_line(line):
     return line.split()
 
 def diagnose_ped(raw_bytes, fn=""):
-    """Analyse la structure d'un PED sans tout charger (sur 20 lignes échantillonnées)."""
     try:
         text = _rt(raw_bytes)
         lines = [l for l in text.splitlines() if l.strip()]
@@ -190,7 +196,6 @@ def diagnose_ped(raw_bytes, fn=""):
         return {"error": f"{type(e).__name__}: {e}"}
 
 def diagnose_map(raw_bytes, fn=""):
-    """Analyse la structure d'un MAP (sur 20 lignes échantillonnées)."""
     try:
         text = _rt(raw_bytes)
         lines = [l for l in text.splitlines() if l.strip()]
@@ -225,44 +230,15 @@ def diagnose_map(raw_bytes, fn=""):
         return {"error": f"{type(e).__name__}: {e}"}
 
 def preview_lines(raw_bytes, n=4):
-    """Retourne les N premières lignes (pour aperçu dans l'UI)."""
     try:
         text = _rt(raw_bytes)
         return [l for l in text.splitlines() if l.strip()][:n]
     except Exception as e:
         return [f"❌ {e}"]
 
-# ============================================================
-# PARSERS
-# ============================================================
-def parse_axiom(raw_bytes, fn=""):
-    raw = gzip.decompress(raw_bytes) if fn.endswith(".gz") or raw_bytes[:2] == b"\x1f\x8b" else raw_bytes
-    lines = [l.rstrip("\r\n") for l in raw.decode("utf-8", errors="replace").splitlines() if l.strip()]
-    if not lines: raise ValueError("Fichier vide")
-    start = 1 if (lines[0].startswith("#") or lines[0].startswith("Sample") or "Sample Filename" in lines[0][:50]) else 0
-    samples, gtypes = [], []
-    for line in lines[start:]:
-        parts = line.split("\t") if "\t" in line else line.split()
-        if len(parts) < 2: continue
-        samples.append(parts[0].strip()); alleles = []
-        for cell in parts[1:]:
-            tk = cell.split()
-            if len(tk) == 2: alleles.append((_ca(tk[0]), _ca(tk[1])))
-            elif len(tk) == 1 and len(tk[0]) == 2 and all(ch in "ACGT0" for ch in tk[0]): alleles.append((tk[0][0], tk[0][1]))
-            else: alleles.append(("0", "0"))
-        gtypes.append(alleles)
-    if not samples: raise ValueError("Aucun échantillon")
-    c = Counter([len(r) for r in gtypes]).most_common(1)[0][0]
-    for i, r in enumerate(gtypes): gtypes[i] = r[:c] + [("0", "0")] * (c - len(r))
-    return samples, gtypes, c
-
-# ============================================================
-# RÉPARATION DE PED CORROMPU (v23.7)
-# ============================================================
 def repair_ped_streaming(raw_bytes):
-    """Répare un PED corrompu (lignes de longueurs variables, tokens parasites). 
+    """Répare un PED corrompu (lignes de longueurs variables, tokens parasites).
     Extrait le breed depuis le FID. Retourne (cleaned_bytes, report_dict)."""
-    import re
     raw = gzip.decompress(raw_bytes) if (len(raw_bytes) >= 2 and raw_bytes[:2] == b"\x1f\x8b") else raw_bytes
     text = raw.decode("utf-8", errors="replace")
     lines_in = text.splitlines()
@@ -351,7 +327,104 @@ def repair_ped_streaming(raw_bytes):
     }
     return cleaned, report
 
-# ✅ NOUVEAU : parse_map universel (multi-format)
+# ============================================================
+# PARSERS
+# ============================================================
+def _parse_call(cell):
+    s = str(cell).strip().upper()
+    if not s or s in (".", "-", "0", "00", "NA", "N/A", "NAN", "NONE", "NC", "NOCALL", "--", "?"):
+        return ("0", "0")
+    for sep in ("/", "_", "|", ":"):
+        if sep in s:
+            parts = [x.strip() for x in s.split(sep)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                return (_ca(parts[0]), _ca(parts[1]))
+            return ("0", "0")
+    try:
+        v = int(float(s))
+        if v == 0: return ("A", "A")
+        if v == 1: return ("A", "B")
+        if v == 2: return ("B", "B")
+        return ("0", "0")
+    except (ValueError, TypeError):
+        pass
+    if len(s) == 2 and all(c in "ACGT" for c in s):
+        return (s[0], s[1])
+    if len(s) == 1 and s in "ACGT":
+        return (s, s)
+    return ("0", "0")
+
+def parse_axiom(raw_bytes, fn=""):
+    raw = gzip.decompress(raw_bytes) if (fn.endswith(".gz") or raw_bytes[:2] == b"\x1f\x8b") else raw_bytes
+    text = raw.decode("utf-8", errors="replace")
+    lines = [l.rstrip("\r\n") for l in text.splitlines() if l.strip() and not l.startswith("#")]
+    del text
+    if not lines:
+        raise ValueError("Fichier vide")
+
+    def _sp(line):
+        return line.split("\t") if "\t" in line else line.split(",") if "," in line else line.split()
+
+    first = _sp(lines[0])
+    hdr_kw = {"sample", "sample_id", "sampleid", "sample filename",
+              "probeset_id", "probe_set_id", "probe set id",
+              "marker", "snp", "snp_id", "id", "axiom_id", "probeset"}
+    is_header = bool(first) and first[0].lower() in hdr_kw
+    header = _sp(lines[0]) if is_header else None
+    data_lines = lines[1:] if is_header else lines
+    if len(data_lines) < 2:
+        raise ValueError("Pas assez de lignes")
+
+    def looks_like_call(cell):
+        c = str(cell).strip().upper()
+        if c in ("AA","AB","BA","BB","A","B","H","N","NC","NOCALL","N/A","0","1","2","-1",".","--","?",""):
+            return True
+        if len(c) == 2 and all(x in "ACGT" for x in c):
+            return True
+        for sep in ("/","_","|",":"):
+            if sep in c and len(c) <= 5:
+                return True
+        try: int(float(c)); return True
+        except (ValueError, TypeError): return False
+
+    sample_row = _sp(data_lines[0])[1:]
+    n_check = min(len(sample_row), 30)
+    ratio = sum(1 for cell in sample_row[:n_check] if looks_like_call(cell)) / max(n_check, 1)
+
+    if ratio > 0.5:
+        snp_ids, calls_by_snp = [], []
+        for line in data_lines:
+            p = _sp(line)
+            if len(p) < 2: continue
+            snp_ids.append(p[0].strip())
+            calls_by_snp.append(p[1:])
+        if not snp_ids:
+            raise ValueError("Aucun SNP")
+        n_samp = len(calls_by_snp[0])
+        sample_names = header[1:] if (header and len(header) > 1) else [f"S{i+1:04d}" for i in range(n_samp)]
+        if len(sample_names) < n_samp:
+            sample_names += [f"S{i+1:04d}" for i in range(len(sample_names), n_samp)]
+        sample_names = sample_names[:n_samp]
+        for i in range(len(calls_by_snp)):
+            if len(calls_by_snp[i]) < n_samp: calls_by_snp[i] += ["."] * (n_samp - len(calls_by_snp[i]))
+            elif len(calls_by_snp[i]) > n_samp: calls_by_snp[i] = calls_by_snp[i][:n_samp]
+        gtypes = [[_parse_call(calls_by_snp[j][i]) for j in range(len(snp_ids))] for i in range(n_samp)]
+        return sample_names, gtypes, len(snp_ids)
+    else:
+        samples, gtypes = [], []
+        for line in data_lines:
+            p = _sp(line)
+            if len(p) < 2: continue
+            samples.append(p[0].strip())
+            gtypes.append([_parse_call(cell) for cell in p[1:]])
+        if not samples:
+            raise ValueError("Aucun échantillon")
+        c = Counter([len(r) for r in gtypes]).most_common(1)[0][0]
+        for i in range(len(gtypes)):
+            if len(gtypes[i]) < c: gtypes[i] += [("0","0")] * (c - len(gtypes[i]))
+            elif len(gtypes[i]) > c: gtypes[i] = gtypes[i][:c]
+        return samples, gtypes, c
+
 def parse_map(b):
     """Parseur MAP universel : gère PLINK standard, 3 colonnes, colonnes inversées, en-tête, séparateurs variés."""
     text = _rt(b)
@@ -364,7 +437,6 @@ def parse_map(b):
             continue
         if p[0].lower().lstrip("#") in ("chr", "chrom", "chromosome", "snp", "marker", "id"):
             continue
-        # Cas 1 : CHR SNP CM BP
         if len(p) >= 4:
             try:
                 cm = float(p[2]) if p[2] not in ("0", ".", "NA", "") else 0.0
@@ -373,7 +445,6 @@ def parse_map(b):
                 continue
             except (ValueError, IndexError):
                 pass
-        # Cas 2 : CHR SNP BP (3 colonnes)
         if len(p) == 3:
             try:
                 bp = int(float(p[2]))
@@ -381,7 +452,6 @@ def parse_map(b):
                 continue
             except (ValueError, IndexError):
                 pass
-        # Cas 3 : SNP CHR BP (inversé)
         if len(p) == 3:
             try:
                 bp = int(float(p[2]))
@@ -390,7 +460,6 @@ def parse_map(b):
                     continue
             except (ValueError, IndexError):
                 pass
-        # Cas 4 : 5+ colonnes (Axiom, Illumina)
         if len(p) >= 5:
             try:
                 bp = int(float(p[3]))
@@ -406,7 +475,6 @@ def parse_map(b):
         df["BP"] = df["BP"] * 1_000_000
     return df
 
-# ✅ NOUVEAU : parse_ped universel + économe en mémoire (int32)
 def parse_ped(b, n_map=None):
     """Parseur PED universel : PLINK standard et non-standard, en-tête, lignes courtes, séparateurs, int32."""
     text = _rt(b)
@@ -471,12 +539,9 @@ def parse_ped(b, n_map=None):
     order = np.argsort(-cnt, axis=0, kind="stable")
     major = order[0]
     minor = order[1] if K > 1 else order[0]
-    A1 = np.array([idx_to_allele[major[j]] if cnt[major[j], j] > 0 else "."
-                   for j in range(n)])
-    A2 = np.array([idx_to_allele[minor[j]] if cnt[minor[j], j] > 0 else "."
-                   for j in range(n)])
-    gt = ((a1 == minor[None, :]).astype(np.float32) +
-          (a2 == minor[None, :]).astype(np.float32))
+    A1 = np.array([idx_to_allele[major[j]] if cnt[major[j], j] > 0 else "." for j in range(n)])
+    A2 = np.array([idx_to_allele[minor[j]] if cnt[minor[j], j] > 0 else "." for j in range(n)])
+    gt = ((a1 == minor[None, :]).astype(np.float32) + (a2 == minor[None, :]).astype(np.float32))
     gt[miss] = np.nan
     return gt, pd.DataFrame({"FID": fids, "IID": iids}), A1.tolist(), A2.tolist()
 
@@ -596,9 +661,7 @@ def rec_fid(ind):
     if df["FID"].nunique() <= 1: df["FID"] = df["IID"].astype(str).str.split("_").str[0]
     return df
 
-# ✅ BONUS : nettoyer un PED brut → PLINK standard
 def clean_ped_to_plink(raw_bytes, n_max_snp=None):
-    """Convertit un PED brut (quel format) en PED standard PLINK prêt pour --file."""
     gt, ind, a1, a2 = parse_ped(raw_bytes, n_max_snp)
     n, m = gt.shape
     lines = []
@@ -1666,7 +1729,7 @@ def mantel_test(A, B, n_perm=999, seed=42):
     return r, (cnt + 1) / (n_perm + 1)
 
 # ============================================================
-# INTERFACE STREAMLIT
+# INTERFACE STREAMLIT — PARTIE 1/2
 # ============================================================
 _KEYS = ["gt", "ind_df", "snp_df", "gt_filt", "ind_filt", "snp_filt", "gt_pre", "ind_pre", "snp_pre", "gt_pruned", "snp_pruned", "qc_stats", "pca_s", "pca_v", "mds_c", "king_K", "fst", "fst_M", "fst_pops", "admix_Q", "admix_K", "cv_res", "ld_df", "roh_df", "froh", "ne_dict", "reyn_D", "reyn_pops",
          "pheno_df", "gwas_res", "gwas_pheno", "lambda_gc", "gebv_df", "gblup_stats", "ann_df", "_plink", "_vcf", "mapping_df", "fst_snp_df", "win_fst", "taj_df", "taj_race", "css_df", "pair_res", "pair_res_race", "pair_res_group", "pair_name_race", "pair_name_group",
@@ -1699,24 +1762,41 @@ def show_pair(key, name_key, plot_key):
 def main():
     init_state(); ss = st.session_state
 
+    # ============================================================
+    # SIDEBAR
+    # ============================================================
     with st.sidebar:
         st.title("🧬 Universal Genomics")
         species_choice = st.selectbox("🐾 Sélectionnez l'espèce", list(SPECIES_CONFIG.keys()))
-        cfg = SPECIES_CONFIG[species_choice]; AUTO = cfg["autosomes"]; ARS = cfg["ars"]; TAXON = cfg["taxon"]; VEP_SPECIES = cfg["vep_species"]; PREFIX = cfg["prefix"]; GROUPES_DEFAULT = cfg["groupes"]
-        if "current_species" not in ss: ss.current_species = species_choice
-        elif ss.current_species != species_choice:
-            ss.current_species = species_choice; reset_derived(keep=()); st.warning(f"🔄 Espèce changée pour {species_choice}. Données réinitialisées.")
+        cfg = SPECIES_CONFIG[species_choice]
+        AUTO = cfg["autosomes"]; ARS = cfg["ars"]; TAXON = cfg["taxon"]
+        VEP_SPECIES = cfg["vep_species"]; PREFIX = cfg["prefix"]; GROUPES_DEFAULT = cfg["groupes"]
 
-        st.header("📁 Données"); mode = st.radio("Source", ["Demo", "PED/MAP", "VCF", "Axiom→PED"], key="src")
+        if "current_species" not in ss:
+            ss.current_species = species_choice
+        elif ss.current_species != species_choice:
+            ss.current_species = species_choice
+            reset_derived(keep=())
+            st.warning(f"🔄 Espèce changée pour {species_choice}. Données réinitialisées.")
+
+        st.header("📁 Données")
+        mode = st.radio("Source", ["Demo", "PED/MAP", "VCF", "Axiom→PED"], key="src")
+
+        # ========== DEMO ==========
         if mode == "Demo":
             if st.button("🎲 Générer démo", width='stretch'):
-                gt, i, s = gen_demo(autosomes=AUTO, ars=ARS); reset_derived(keep=()); ss.update({"gt": gt, "ind_df": rec_fid(i), "snp_df": s}); st.success("✅ Démo générée")
+                gt, i, s = gen_demo(autosomes=AUTO, ars=ARS)
+                reset_derived(keep=())
+                ss.update({"gt": gt, "ind_df": rec_fid(i), "snp_df": s})
+                st.success("✅ Démo générée")
+
+        # ========== PED/MAP (avec auto-réparation) ==========
         elif mode == "PED/MAP":
             ped = st.file_uploader(".ped (ou .txt, .csv)", type=["ped", "txt", "csv", "gz"])
             mp = st.file_uploader(".map (ou .txt)", type=["map", "txt", "gz"])
 
             if ped and mp:
-                # --- DIAGNOSTIC (nouveau) ---
+                # --- Diagnostic ---
                 if st.button("🔍 Diagnostiquer les fichiers", width='stretch'):
                     try:
                         d_ped = diagnose_ped(ped.getvalue(), ped.name)
@@ -1753,13 +1833,52 @@ def main():
                     except Exception as e:
                         st.error(f"❌ Diagnostic échoué : {type(e).__name__}: {e}")
 
-                # --- CHARGEMENT ---
-                if st.button("📥 Charger les fichiers", type="primary", width='stretch'):
+                # --- Chargement avec auto-réparation ---
+                if st.button("📥 Charger les fichiers (auto-réparation)", type="primary", width='stretch'):
                     try:
+                        # 1. MAP
                         with st.spinner("Lecture MAP..."):
                             mdf = parse_map(mp.getvalue())
+
+                        # 2. Détection auto de corruption dans le PED
+                        ped_bytes = ped.getvalue()
+                        needs_repair = False
+                        try:
+                            text = _rt(ped_bytes)
+                            sample = [l for l in text.splitlines() if l.strip()][:500]
+                            del text
+                            if len(sample) > 5:
+                                lens = set(len(l.split()) for l in sample)
+                                if len(lens) > 1:
+                                    needs_repair = True
+                                    st.warning(f"⚠️ PED incohérent détecté ({len(lens)} longueurs de lignes différentes) → réparation automatique…")
+                        except Exception:
+                            needs_repair = True
+
+                        # 3. Réparation si nécessaire
+                        if needs_repair:
+                            with st.spinner("Réparation du PED..."):
+                                ped_bytes, report = repair_ped_streaming(ped_bytes)
+                            if report["n_errors"] > 0:
+                                st.warning(f"⚠️ {report['n_errors']} ligne(s) non réparée(s)")
+                                for iss in report["issues"]:
+                                    st.text(f"   {iss}")
+                            st.success(f"✅ Réparé : {report['n_fixed']} lignes corrigées · "
+                                       f"{report['n_kept']} intactes · {report['n_breeds']} populations")
+                            with st.expander("🐪 Détails des populations détectées", expanded=False):
+                                for b, n in report["breeds"].items():
+                                    st.text(f"   {b:15s} : {n:4d} individus")
+                            with st.expander("📏 Vérification cohérence"):
+                                st.text(f"Longueurs de lignes : {report['line_lengths']}")
+                                st.text(f"Cohérent : {'✅ OUI' if report['coherent'] else '⚠️ NON'}")
+                                st.text(f"Allèles valides : {'✅ OUI' if report['alleles_valid'] else '⚠️ NON'}")
+                                st.text(f"Échantillon allèles : {report['alleles_sample']}")
+
+                        # 4. Parser le PED (réparé ou intact)
                         with st.spinner(f"Lecture PED ({len(mdf)} SNPs attendus)..."):
-                            gt, ind, a1, a2 = parse_ped(ped.getvalue(), len(mdf))
+                            gt, ind, a1, a2 = parse_ped(ped_bytes, len(mdf))
+
+                        # 5. Aligner + charger
                         n = min(gt.shape[1], len(mdf))
                         mdf = mdf.iloc[:n].reset_index(drop=True)
                         gt = gt[:, :n]
@@ -1767,25 +1886,39 @@ def main():
                         mdf["A2"] = a2[:n]
                         reset_derived(keep=())
                         ss.update({"gt": gt, "ind_df": rec_fid(ind), "snp_df": mdf})
-                        st.success(f"✅ {gt.shape[0]} ind × {gt.shape[1]} SNPs chargés")
+
+                        st.success(f"✅ {gt.shape[0]} ind × {gt.shape[1]} SNPs chargés — prêt pour le QC")
+
+                        # 6. Résumé populations
+                        pop_counts = ind["FID"].value_counts().to_dict() if "FID" in ind.columns else {}
+                        st.info(f"🐪 {len(pop_counts)} populations : {pop_counts}")
+
                     except MemoryError:
-                        st.error("❌ Mémoire insuffisante. Filtrez les SNPs avant l'upload ou essayez un fichier plus petit.")
+                        st.error("❌ Mémoire insuffisante. Filtrez les SNPs avant l'upload.")
                     except Exception as e:
                         st.error(f"❌ {type(e).__name__}: {e}")
 
-                # --- BONUS : Nettoyer en PED standard ---
+                # --- Bonus : Nettoyer en PED standard ---
                 if st.button("📤 Nettoyer en PED standard PLINK", width='stretch'):
                     try:
                         cleaned = clean_ped_to_plink(ped.getvalue())
                         st.download_button("⬇ Télécharger PED nettoyé", cleaned.encode(), "cleaned.ped", "text/plain", width='stretch')
                     except Exception as e:
                         st.error(f"❌ {type(e).__name__}: {e}")
+
+        # ========== VCF ==========
         elif mode == "VCF":
             vf = st.file_uploader(".vcf", type=["vcf", "gz"])
             if vf and st.button("📥 Charger"):
                 try:
-                    gt, ind, snp = parse_vcf(vf.getvalue()); reset_derived(keep=()); ss.update({"gt": gt, "ind_df": rec_fid(ind), "snp_df": snp}); st.success(f"✅ {gt.shape[0]}×{gt.shape[1]}")
-                except Exception as e: st.error(f"❌ {e}")
+                    gt, ind, snp = parse_vcf(vf.getvalue())
+                    reset_derived(keep=())
+                    ss.update({"gt": gt, "ind_df": rec_fid(ind), "snp_df": snp})
+                    st.success(f"✅ {gt.shape[0]}×{gt.shape[1]}")
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
+        # ========== Axiom → PED ==========
         else:
             af = st.file_uploader("Axiom brut", type=["txt", "csv", "tsv", "gz"])
             map_file = st.file_uploader("Fichier .map réel (optionnel mais très recommandé)", type=["map"])
@@ -1796,670 +1929,1346 @@ def main():
                         mdf = parse_map(map_file.getvalue())
                         n_m = min(len(mdf), ns)
                         mpl = [f"{row['CHR']}\t{row['SNP']}\t{row['CM']}\t{row['BP']}" for _, row in mdf.iloc[:n_m].iterrows()]
-                        st.info(f"✅ Utilisation de votre fichier .map réel ({n_m} SNPs). Tous les chromosomes sont conservés.")
+                        st.info(f"✅ Utilisation de votre fichier .map réel ({n_m} SNPs).")
                     else:
                         mpl = [f"1\tSNP_{i + 1:06d}\t0\t{i + 1}" for i in range(ns)]
-                        st.warning("⚠️ La .map générée est factice (chr 1, positions 1..N) : chargez la vraie carte de la puce pour conserver tous les chromosomes.")
+                        st.warning("⚠️ MAP factice (chr 1, positions 1..N) : chargez la vraie carte pour conserver les chromosomes.")
                     pdl = ["\t".join([sample_fid_iid(smp)[0], sample_fid_iid(smp)[1], "0", "0", "0", "-9"] + [a for pr in row for a in pr]) for smp, row in zip(s, g)]
-                    ss["_plink_ped"] = "\n".join(pdl) + "\n"; ss["_plink_map"] = "\n".join(mpl) + "\n"; st.success(f"✅ {len(s)}×{ns}")
-                except Exception as e: st.error(f"❌ {e}")
+                    ss["_plink_ped"] = "\n".join(pdl) + "\n"
+                    ss["_plink_map"] = "\n".join(mpl) + "\n"
+                    st.success(f"✅ {len(s)}×{ns}")
+                except Exception as e:
+                    st.error(f"❌ {e}")
             if ss.get("_plink_ped"):
                 st.download_button("⬇ .ped", ss["_plink_ped"].encode(), "out.ped", width='stretch')
                 st.download_button("⬇ .map", ss["_plink_map"].encode(), "out.map", width='stretch')
 
+        # ========== SEUILS QC ==========
         st.divider(); st.header("⚙️ Seuils QC")
-        keep_auto = st.checkbox("🧬 Exclure Chromosomes Sexuels (X, Y, MT)", value=True); rem_out = st.checkbox("🚫 Supprimer outliers", value=True)
-        geno = st.slider("Missing SNP", 0.0, 0.5, 0.05); mind = st.slider("Missing Ind", 0.0, 0.5, 0.05); maf_t = st.slider("MAF", 0.0, 0.5, 0.05)
-        hwe_t = st.number_input("HWE (p min)", value=1e-6, min_value=0.0, max_value=1.0, step=1e-6, format="%.0e"); het_sd = st.slider("Het ±σ", 1.0, 5.0, 3.0, 0.1)
-        hwe_pop = st.checkbox("HWE par population (recommandé)", value=True); hwe_k = st.slider("Exclure si HWE rejeté dans ≥ k populations", 1, 10, 2) if hwe_pop else 1
-        ld_r2 = st.slider("LD r²", 0.05, 0.5, 0.2, 0.05); ld_w = st.slider("LD fenêtre (SNPs)", 20, 200, 50, 10)
+        keep_auto = st.checkbox("🧬 Exclure Chromosomes Sexuels (X, Y, MT)", value=True)
+        rem_out = st.checkbox("🚫 Supprimer outliers", value=True)
+        geno = st.slider("Missing SNP", 0.0, 0.5, 0.05)
+        mind = st.slider("Missing Ind", 0.0, 0.5, 0.05)
+        maf_t = st.slider("MAF", 0.0, 0.5, 0.05)
+        hwe_t = st.number_input("HWE (p min)", value=1e-6, min_value=0.0, max_value=1.0, step=1e-6, format="%.0e")
+        het_sd = st.slider("Het ±σ", 1.0, 5.0, 3.0, 0.1)
+        hwe_pop = st.checkbox("HWE par population (recommandé)", value=True)
+        hwe_k = st.slider("Exclure si HWE rejeté dans ≥ k populations", 1, 10, 2) if hwe_pop else 1
+        ld_r2 = st.slider("LD r²", 0.05, 0.5, 0.2, 0.05)
+        ld_w = st.slider("LD fenêtre (SNPs)", 20, 200, 50, 10)
 
-    if ss.gt is None: st.info(f"👉 Chargez des données pour {species_choice} (Demo recommandé)."); return
+    # ============================================================
+    # CORPS PRINCIPAL
+    # ============================================================
+    if ss.gt is None:
+        st.info(f"👉 Chargez des données pour {species_choice} (Demo recommandé).")
+        return
+
     st.title(f"🐾 {species_choice} Genomics Pipeline v23.7")
-    tabs = st.tabs(["🧹 QC", "✂️ LD", "🧬 Structure", "🎨 Admixture", "📈 Démographie", "🔍 Sélection", "🧪 GWAS Classique", "🎯 Post-GWAS", "📈 GBLUP", "🧬 Annotation", "🧬 VEP & NCBI", "🧬 Structure 3D", "🧬 Alignement", "📤 Export", "🔬 Méta-analyse", "🧠 ML", "🧬 Génotypes/blocs", "🌍 Orthologue humain", "📐 Stats publication"])
+    tabs = st.tabs(["🧹 QC", "✂️ LD", "🧬 Structure", "🎨 Admixture", "📈 Démographie", "🔍 Sélection",
+                    "🧪 GWAS Classique", "🎯 Post-GWAS", "📈 GBLUP", "🧬 Annotation", "🧬 VEP & NCBI",
+                    "🧬 Structure 3D", "🧬 Alignement", "📤 Export", "🔬 Méta-analyse", "🧠 ML",
+                    "🧬 Génotypes/blocs", "🌍 Orthologue humain", "📐 Stats publication"])
     NEED_QC = "⚠️ Lancez d'abord le QC (onglet 🧹)."
 
-    # ---------------- QC ----------------
+    # ---------------- TAB 0 : QC ----------------
     with tabs[0]:
         if st.button("▶ Lancer QC", key="qc_btn"):
             try:
-                p = {"geno": geno, "mind": mind, "maf": maf_t, "hwe": hwe_t, "het_sd": het_sd, "hwe_pop": hwe_pop, "hwe_k": hwe_k}
-                gf, inf, snf, qs = apply_qc(ss.gt, ss.ind_df, ss.snp_df, p, AUTO, keep_autosomes=keep_auto, rem_out=rem_out)
-                reset_derived(keep=("gt", "ind_df", "snp_df", "mapping_df")); ss.update({"gt_filt": gf, "ind_filt": inf, "snp_filt": snf, "qc_stats": qs}); st.success(f"✅ {gf.shape[0]}×{gf.shape[1]} (les analyses en aval ont été réinitialisées)")
-            except Exception as e: st.error(f"❌ {e}")
-        if ss.qc_stats:
-            s = ss.qc_stats; c1, c2, c3, c4 = st.columns(4); c1.metric("Individus", s["n_ind_final"], delta=-s["excluded_ind"]); c2.metric("SNPs", s["n_snp_final"], delta=-s["excluded_snp"])
-            c3.metric("Individus avant outliers", s["n_ind_pre"]); c4.metric("Outliers (het)", s["trace"].get("het", 0)); st.caption(f"Détail des exclusions SNP/individus : {s['trace']}")
-        st.plotly_chart(plot_missing(miss_ind(ss.gt), miss_snp(ss.gt)), width='stretch', key="plot_missing_qc"); st.caption("Histogrammes calculés sur les données brutes (avant QC).")
+                p = {"geno": geno, "mind": mind, "maf": maf_t, "hwe": hwe_t, "het_sd": het_sd,
+                     "hwe_pop": hwe_pop, "hwe_k": hwe_k}
+                gf, inf, snf, qs = apply_qc(ss.gt, ss.ind_df, ss.snp_df, p, AUTO,
+                                            keep_autosomes=keep_auto, rem_out=rem_out)
+                reset_derived(keep=("gt", "ind_df", "snp_df", "mapping_df"))
+                ss.update({"gt_filt": gf, "ind_filt": inf, "snp_filt": snf, "qc_stats": qs})
+                st.success(f"✅ {gf.shape[0]}×{gf.shape[1]} (analyses aval réinitialisées)")
+            except Exception as e:
+                st.error(f"❌ {e}")
 
-    # ---------------- LD ----------------
+        if ss.qc_stats:
+            s = ss.qc_stats
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Individus", s["n_ind_final"], delta=-s["excluded_ind"])
+            c2.metric("SNPs", s["n_snp_final"], delta=-s["excluded_snp"])
+            c3.metric("Individus avant outliers", s["n_ind_pre"])
+            c4.metric("Outliers (het)", s["trace"].get("het", 0))
+            st.caption(f"Détail des exclusions : {s['trace']}")
+
+        st.plotly_chart(plot_missing(miss_ind(ss.gt), miss_snp(ss.gt)), width='stretch', key="plot_missing_qc")
+        st.caption("Histogrammes calculés sur les données brutes (avant QC).")
+
+    # ---------------- TAB 1 : LD ----------------
     with tabs[1]:
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
             if st.button("▶ LD Pruning", key="ld_btn"):
                 with st.spinner("Élagage LD par chromosome..."):
                     k = ld_pruning(ss.gt_filt, ss.snp_filt["CHR"].astype(str).values, int(ld_w), 5, ld_r2)
-                ss.update({"gt_pruned": ss.gt_filt[:, k], "snp_pruned": ss.snp_filt.iloc[np.where(k)[0]].reset_index(drop=True), "pca_s": None, "pca_v": None, "mds_c": None, "king_K": None, "admix_Q": None}); st.success(f"✅ {ss.gt_pruned.shape[1]} SNPs conservés")
+                ss.update({"gt_pruned": ss.gt_filt[:, k],
+                           "snp_pruned": ss.snp_filt.iloc[np.where(k)[0]].reset_index(drop=True),
+                           "pca_s": None, "pca_v": None, "mds_c": None, "king_K": None, "admix_Q": None})
+                st.success(f"✅ {ss.gt_pruned.shape[1]} SNPs conservés")
+
             if ss.gt_pruned is not None:
-                c1, c2, c3 = st.columns(3); c1.metric("Avant", ss.gt_filt.shape[1]); c2.metric("Après", ss.gt_pruned.shape[1]); c3.metric("Réduction", f"{100 * (1 - ss.gt_pruned.shape[1] / ss.gt_filt.shape[1]):.1f}%")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Avant", ss.gt_filt.shape[1])
+                c2.metric("Après", ss.gt_pruned.shape[1])
+                c3.metric("Réduction", f"{100 * (1 - ss.gt_pruned.shape[1] / ss.gt_filt.shape[1]):.1f}%")
+
             if st.button("▶ LD Decay (sur SNPs non élagués)", key="ld_decay_btn"):
-                with st.spinner("Calcul du LD..."): ss.ld_df = ld_decay(ss.gt_filt, ss.snp_filt)
+                with st.spinner("Calcul du LD..."):
+                    ss.ld_df = ld_decay(ss.gt_filt, ss.snp_filt)
+
             if ss.ld_df is not None:
                 f = plot_ld(ss.ld_df)
                 if f: st.plotly_chart(f, width='stretch', key="plot_ld_decay")
-                else: st.warning("Pas assez de paires de SNPs proches pour estimer le LD.")
+                else: st.warning("Pas assez de paires de SNPs proches.")
 
-    # ---------------- Structure ----------------
+    # ---------------- TAB 2 : Structure ----------------
     with tabs[2]:
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
             gu, su, iu = work_data()
             if st.button("▶ PCA + MDS + KING", key="struct_btn"):
                 try:
                     with st.spinner("PCA, MDS, KING..."):
-                        s_, v_ = pca_analysis(gu, 10); ss.update({"pca_s": s_, "pca_v": v_, "mds_c": mds_analysis(gu, 5), "king_K": king_mat(gu)})
+                        s_, v_ = pca_analysis(gu, 10)
+                        ss.update({"pca_s": s_, "pca_v": v_,
+                                   "mds_c": mds_analysis(gu, 5), "king_K": king_mat(gu)})
                     st.success("✅")
-                except Exception as e: st.error(f"❌ {e}")
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
             if ss.pca_s is not None and len(ss.pca_s) == len(iu):
-                st.plotly_chart(plot_pca(ss.pca_s, ss.pca_v, iu["FID"].values), width='stretch', key="plot_pca_tab"); st.plotly_chart(plot_mds(ss.mds_c, iu["FID"].values), width='stretch', key="plot_mds_tab")
+                st.plotly_chart(plot_pca(ss.pca_s, ss.pca_v, iu["FID"].values), width='stretch', key="plot_pca_tab")
+                st.plotly_chart(plot_mds(ss.mds_c, iu["FID"].values), width='stretch', key="plot_mds_tab")
                 if ss.king_K is not None:
-                    Kt = np.triu(ss.king_K, 1); st.info(f"Paires apparentées (KING φ > 0.177, 1er degré) : **{int((Kt > 0.177).sum())}** · 2e degré (φ > 0.088) : **{int((Kt > 0.088).sum())}**")
-            st.divider(); st.subheader("📊 Indices de Diversité Génétique (Ho, He, PIC, Fis)"); st.markdown("Indices standards (Nei, 1973 ; Botstein et al., 1980).")
+                    Kt = np.triu(ss.king_K, 1)
+                    st.info(f"Paires apparentées (KING φ > 0.177, 1er degré) : **{int((Kt > 0.177).sum())}** · 2e degré (φ > 0.088) : **{int((Kt > 0.088).sum())}**")
+
+            st.divider()
+            st.subheader("📊 Indices de Diversité Génétique (Ho, He, PIC, Fis)")
+            st.markdown("Indices standards (Nei, 1973 ; Botstein et al., 1980).")
             if st.button("Calculer la Diversité", type="primary", key="div_btn"):
                 try:
-                    with st.spinner("Calcul des indices..."): ss.div_df = compute_diversity(gu, iu["FID"].astype(str).values)
-                except Exception as e: st.error(f"❌ Erreur lors du calcul : {e}")
-            if ss.div_df is not None and not ss.div_df.empty:
-                d = ss.div_df; st.dataframe(d, width='stretch'); st.download_button("⬇ Télécharger le tableau (CSV)", d.to_csv(index=False).encode("utf-8"), "tableau_diversite.csv", "text/csv")
-                st.plotly_chart(px.bar(d, x="Population", y=["H_Observee (Ho)", "H_Attendue (He)"], barmode="group", title="Hétérozygotie Observée vs Attendue par Population", labels={"value": "Hétérozygotie", "variable": "Type"}), width='stretch', key="plot_div")
-                st.info(f"**Moyennes :** He = {d['H_Attendue (He)'].mean():.4f} | Ho = {d['H_Observee (Ho)'].mean():.4f} | PIC = {d['PIC'].mean():.4f} | Fis = {d['Fis (Consanguinité)'].mean():.4f}")
-            elif ss.div_df is not None: st.warning("Aucune population avec ≥ 3 individus.")
+                    with st.spinner("Calcul..."):
+                        ss.div_df = compute_diversity(gu, iu["FID"].astype(str).values)
+                except Exception as e:
+                    st.error(f"❌ {e}")
 
-    # ---------------- Admixture ----------------
+            if ss.div_df is not None and not ss.div_df.empty:
+                d = ss.div_df
+                st.dataframe(d, width='stretch')
+                st.download_button("⬇ CSV", d.to_csv(index=False).encode("utf-8"), "tableau_diversite.csv", "text/csv")
+                st.plotly_chart(px.bar(d, x="Population", y=["H_Observee (Ho)", "H_Attendue (He)"], barmode="group",
+                                       title="Ho vs He par Population",
+                                       labels={"value": "Hétérozygotie", "variable": "Type"}),
+                                width='stretch', key="plot_div")
+                st.info(f"**Moyennes :** He = {d['H_Attendue (He)'].mean():.4f} | Ho = {d['H_Observee (Ho)'].mean():.4f} | PIC = {d['PIC'].mean():.4f} | Fis = {d['Fis (Consanguinité)'].mean():.4f}")
+            elif ss.div_df is not None:
+                st.warning("Aucune population avec ≥ 3 individus.")
+
+    # ---------------- TAB 3 : Admixture ----------------
     with tabs[3]:
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
-            gu, su, iu = work_data(); st.subheader("📊 Choix de K par courbe d'erreur NMF"); c1, c2 = st.columns(2); kmin = c1.slider("K min", 2, 5, 2, key="kmin_sl"); kmax = c2.slider("K max", 4, 10, 8, key="kmax_sl")
+            gu, su, iu = work_data()
+            st.subheader("📊 Choix de K par courbe d'erreur NMF")
+            c1, c2 = st.columns(2)
+            kmin = c1.slider("K min", 2, 5, 2, key="kmin_sl")
+            kmax = c2.slider("K max", 4, 10, 8, key="kmax_sl")
             if st.button("📈 Évaluer tous les K", key="eval_k_btn"):
-                with st.spinner("NMF pour chaque K..."): ss.cv_res = choose_best_k(gu, kmin, kmax)
-            if ss.cv_res is not None: st.dataframe(ss.cv_res, width='stretch'); st.plotly_chart(px.line(ss.cv_res, x="K", y="RMSE", markers=True, title="Erreur NMF par K (choisir l'elbow)"), width='stretch', key="plot_k_curve")
-            st.divider(); K = st.slider("K choisi", 2, 10, 4, key="admix_K_slider"); st.caption("ℹ️ Approximation par NMF (pas un vrai modèle ADMIXTURE/STRUCTURE) : à valider avec ADMIXTURE pour publication.")
+                with st.spinner("NMF pour chaque K..."):
+                    ss.cv_res = choose_best_k(gu, kmin, kmax)
+            if ss.cv_res is not None:
+                st.dataframe(ss.cv_res, width='stretch')
+                st.plotly_chart(px.line(ss.cv_res, x="K", y="RMSE", markers=True, title="Erreur NMF par K"),
+                                width='stretch', key="plot_k_curve")
+
+            st.divider()
+            K = st.slider("K choisi", 2, 10, 4, key="admix_K_slider")
+            st.caption("ℹ️ Approximation par NMF (pas un vrai ADMIXTURE/STRUCTURE).")
             if st.button("▶ Admixture NMF", key="admix_btn"):
                 try:
-                    with st.spinner("NMF..."): Q, _ = admixture_nmf(gu, K=K)
-                    ss.update({"admix_Q": Q, "admix_K": K}); st.success("✅")
-                except Exception as e: st.error(f"❌ {e}")
+                    with st.spinner("NMF..."):
+                        Q, _ = admixture_nmf(gu, K=K)
+                    ss.update({"admix_Q": Q, "admix_K": K})
+                    st.success("✅")
+                except Exception as e:
+                    st.error(f"❌ {e}")
             if ss.admix_Q is not None and len(ss.admix_Q) == len(iu):
-                f, _ = plot_admix(ss.admix_Q, iu["IID"].values, iu["FID"].values, ss.admix_K); st.plotly_chart(f, width='stretch', key="plot_admix_tab")
+                f, _ = plot_admix(ss.admix_Q, iu["IID"].values, iu["FID"].values, ss.admix_K)
+                st.plotly_chart(f, width='stretch', key="plot_admix_tab")
 
-    # ---------------- Démographie ----------------
+    # ---------------- TAB 4 : Démographie ----------------
     with tabs[4]:
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
-            c1, c2 = st.columns(2); min_snps = c1.number_input("SNPs min par ROH", 10, 200, 30, key="roh_ms"); min_kb = c2.number_input("Longueur min ROH (kb)", 100, 5000, 500, 100, key="roh_kb")
-            st.caption("ROH et Ne sont calculés sur les SNPs filtrés QC mais NON élagués (l'élagage LD détruit le signal).")
+            c1, c2 = st.columns(2)
+            min_snps = c1.number_input("SNPs min par ROH", 10, 200, 30, key="roh_ms")
+            min_kb = c2.number_input("Longueur min ROH (kb)", 100, 5000, 500, 100, key="roh_kb")
+            st.caption("ROH et Ne : SNPs filtrés QC mais NON élagués.")
+
             if st.button("▶ ROH + Ne", key="dem_btn"):
                 try:
                     gf, sf, inf = ss.gt_filt, ss.snp_filt, ss.ind_filt
-                    with st.spinner("Détection des ROH..."): roh, fr = detect_roh(gf, sf["CHR"].astype(str).values, sf["BP"].values, int(min_snps), float(min_kb))
-                    ss.update({"roh_df": roh, "froh": fr}); ne = {}
+                    with st.spinner("Détection des ROH..."):
+                        roh, fr = detect_roh(gf, sf["CHR"].astype(str).values, sf["BP"].values,
+                                            int(min_snps), float(min_kb))
+                    ss.update({"roh_df": roh, "froh": fr})
+                    ne = {}
                     with st.spinner("Ne historique..."):
                         for f in inf["FID"].unique():
                             m = (inf["FID"] == f).values
                             if m.sum() >= 5:
                                 nd = ne_historical(gf[m], sf)
-                                if not nd.empty: ne[str(f)] = nd
-                    ss.ne_dict = ne; st.success(f"✅ {len(roh)} ROH")
-                except Exception as e: st.error(f"❌ {e}")
+                                if not nd.empty:
+                                    ne[str(f)] = nd
+                    ss.ne_dict = ne
+                    st.success(f"✅ {len(roh)} ROH")
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
             if ss.froh is not None and len(ss.froh) == len(ss.ind_filt):
-                df = pd.DataFrame({"FROH": ss.froh, "Pop": ss.ind_filt["FID"].values}); st.plotly_chart(px.histogram(df, x="FROH", color="Pop", nbins=50, title="FROH"), width='stretch', key="plot_roh_hist")
-                st.dataframe(df.groupby("Pop")["FROH"].agg(["count", "mean", "std", "max"]).round(4), width='stretch')
+                df = pd.DataFrame({"FROH": ss.froh, "Pop": ss.ind_filt["FID"].values})
+                st.plotly_chart(px.histogram(df, x="FROH", color="Pop", nbins=50, title="FROH"),
+                                width='stretch', key="plot_roh_hist")
+                st.dataframe(df.groupby("Pop")["FROH"].agg(["count", "mean", "std", "max"]).round(4),
+                             width='stretch')
                 if ss.roh_df is not None and not ss.roh_df.empty:
-                    st.markdown("### 📏 ROH par classes de taille (moyenne par individu)"); roh = ss.roh_df; n_ind = len(ss.ind_filt); L_kb = sum(ARS[c] for c in AUTO) * 1000
+                    st.markdown("### 📏 ROH par classes de taille")
+                    roh = ss.roh_df
+                    n_ind = len(ss.ind_filt)
+                    L_kb = sum(ARS[c] for c in AUTO) * 1000
                     col1, col2, col3 = st.columns(3)
-                    for col, thr, lab in ((col1, 1500, "FROH > 1.5 Mb (Ancien)"), (col2, 5000, "FROH > 5 Mb (Récent)"), (col3, 10000, "FROH > 10 Mb (Très récent)")):
+                    for col, thr, lab in ((col1, 1500, "FROH > 1.5 Mb (Ancien)"),
+                                          (col2, 5000, "FROH > 5 Mb (Récent)"),
+                                          (col3, 10000, "FROH > 10 Mb (Très récent)")):
                         col.metric(lab, f"{roh[roh['length_kb'] > thr]['length_kb'].sum() / (L_kb * n_ind):.4f}")
+
             if ss.ne_dict:
                 fig = go.Figure()
-                for k, d in ss.ne_dict.items(): fig.add_trace(go.Scatter(x=d["GenAgo"], y=d["Ne"], mode="lines+markers", name=k))
-                fig.update_layout(title="Ne historique (LD, Sved 1971)", xaxis_title="Générations passées", yaxis_title="Ne", xaxis_type="log", yaxis_type="log", height=450); st.plotly_chart(fig, width='stretch', key="plot_ne")
+                for k, d in ss.ne_dict.items():
+                    fig.add_trace(go.Scatter(x=d["GenAgo"], y=d["Ne"], mode="lines+markers", name=k))
+                fig.update_layout(title="Ne historique (LD, Sved 1971)",
+                                  xaxis_title="Générations passées", yaxis_title="Ne",
+                                  xaxis_type="log", yaxis_type="log", height=450)
+                st.plotly_chart(fig, width='stretch', key="plot_ne")
 
-    # ---------------- Sélection ----------------
+    # ---------------- TAB 5 : Sélection ----------------
     with tabs[5]:
         st.subheader("🔍 Sélection & structure des populations")
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
-            gu, su, iu = work_data(); lab = iu["FID"].astype(str).values; use_wc = st.checkbox("Utiliser Weir & Cockerham (1984) — recommandé", value=True, key="use_wc84")
+            gu, su, iu = work_data()
+            lab = iu["FID"].astype(str).values
+            use_wc = st.checkbox("Utiliser Weir & Cockerham (1984)", value=True, key="use_wc84")
+
             if st.button("▶ FST pairwise + Reynolds", key="fst_btn"):
                 try:
-                    if len(set(lab)) < 2: raise ValueError("Au moins 2 populations (FID) requises")
+                    if len(set(lab)) < 2:
+                        raise ValueError("Au moins 2 populations (FID) requises")
                     with st.spinner("FST..."):
-                        ss.fst = fst_snp_wc(gu, lab); ss.fst_snp_df = su.copy(); M, pops = fst_pairwise(gu, lab, use_wc84=use_wc); ss.update({"fst_M": M, "fst_pops": pops}); D, rp = reynolds(gu, lab); ss.update({"reyn_D": D, "reyn_pops": rp})
+                        ss.fst = fst_snp_wc(gu, lab)
+                        ss.fst_snp_df = su.copy()
+                        M, pops = fst_pairwise(gu, lab, use_wc84=use_wc)
+                        ss.update({"fst_M": M, "fst_pops": pops})
+                        D, rp = reynolds(gu, lab)
+                        ss.update({"reyn_D": D, "reyn_pops": rp})
                     st.success("✅")
-                except Exception as e: st.error(f"❌ {e}")
-            if ss.fst is not None:
-                sf = ss.fst_snp_df if ss.fst_snp_df is not None else su; nf = min(len(ss.fst), len(sf))
-                dff = pd.DataFrame({"SNP": sf["SNP"].values[:nf], "CHR": sf["CHR"].values[:nf], "BP": sf["BP"].values[:nf], "FST": ss.fst[:nf]})
-                st.plotly_chart(plot_manhattan(dff, yc="FST", title="FST par SNP (W&C 1984)"), width='stretch', key="plot_manh_fst_snp")
-                c1, c2 = st.columns(2)
-                c1.plotly_chart(px.imshow(ss.fst_M, x=ss.fst_pops, y=ss.fst_pops, text_auto=".3f", color_continuous_scale="Viridis", title="FST pairwise (global)"), width='stretch', key="plot_fst_mat")
-                c2.plotly_chart(px.imshow(ss.reyn_D, x=ss.reyn_pops, y=ss.reyn_pops, text_auto=".3f", color_continuous_scale="Viridis", title="Distance de Reynolds"), width='stretch', key="plot_reyn_mat")
+                except Exception as e:
+                    st.error(f"❌ {e}")
 
-            st.divider(); st.subheader("🌳 Arbre UPGMA (bootstrap)")
+            if ss.fst is not None:
+                sf = ss.fst_snp_df if ss.fst_snp_df is not None else su
+                nf = min(len(ss.fst), len(sf))
+                dff = pd.DataFrame({"SNP": sf["SNP"].values[:nf], "CHR": sf["CHR"].values[:nf],
+                                    "BP": sf["BP"].values[:nf], "FST": ss.fst[:nf]})
+                st.plotly_chart(plot_manhattan(dff, yc="FST", title="FST par SNP (W&C 1984)"),
+                                width='stretch', key="plot_manh_fst_snp")
+                c1, c2 = st.columns(2)
+                c1.plotly_chart(px.imshow(ss.fst_M, x=ss.fst_pops, y=ss.fst_pops, text_auto=".3f",
+                                          color_continuous_scale="Viridis", title="FST pairwise"),
+                                width='stretch', key="plot_fst_mat")
+                c2.plotly_chart(px.imshow(ss.reyn_D, x=ss.reyn_pops, y=ss.reyn_pops, text_auto=".3f",
+                                          color_continuous_scale="Viridis", title="Distance de Reynolds"),
+                                width='stretch', key="plot_reyn_mat")
+
+            # UPGMA
+            st.divider()
+            st.subheader("🌳 Arbre UPGMA (bootstrap)")
             if ss.reyn_D is not None:
-                c1, c2 = st.columns(2); nb = c1.slider("Bootstrap", 10, 500, 100, 10, key="nj_boot"); ro = c2.selectbox("Root", ["Non-enraciné", "Midpoint"], key="nj_root")
+                c1, c2 = st.columns(2)
+                nb = c1.slider("Bootstrap", 10, 500, 100, 10, key="nj_boot")
+                ro = c2.selectbox("Root", ["Non-enraciné", "Midpoint"], key="nj_root")
                 if st.button("🌲 Construire l'arbre", type="primary", key="nj_btn"):
                     try:
-                        with st.spinner(f"UPGMA + {nb} boot..."): r = upgma_bootstrap(gu, su, lab, n_boot=int(nb)); ss.nj_result = r; ss.nj_mid = midpoint_info(r["D"], r["pops"])
+                        with st.spinner(f"UPGMA + {nb} boot..."):
+                            r = upgma_bootstrap(gu, su, lab, n_boot=int(nb))
+                            ss.nj_result = r
+                            ss.nj_mid = midpoint_info(r["D"], r["pops"])
                         st.success("✅")
-                    except Exception as e: st.error(f"❌ {e}")
-                if ss.nj_result is not None:
-                    r = ss.nj_result; mp = ss.nj_mid; c1, c2, c3, c4 = st.columns(4); c1.metric("Races", len(r["pops"])); c2.metric("Nœuds", len(r["support"])); c3.metric("Supp≥70%", f"{(r['support'] >= 70).sum()}/{len(r['support'])}"); c4.metric("Dist max", f"{mp['max_dist']:.4f}" if mp else "N/A")
-                    if mp: st.info(f"Midpoint entre **{mp['leaf_i']}** et **{mp['leaf_j']}**")
-                    st.plotly_chart(plot_tree(r["Z"], r["pops"], r["support"], title="UPGMA (bootstrap)", mid=mp if ro == "Midpoint" else None), width='stretch', key="plot_nj_tree")
-                    with st.expander("Newick"): st.code(r["newick"])
+                    except Exception as e:
+                        st.error(f"❌ {e}")
 
-            st.divider(); st.subheader("🧬 GWAS case-control")
+                if ss.nj_result is not None:
+                    r = ss.nj_result; mp = ss.nj_mid
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Races", len(r["pops"]))
+                    c2.metric("Nœuds", len(r["support"]))
+                    c3.metric("Supp≥70%", f"{(r['support'] >= 70).sum()}/{len(r['support'])}")
+                    c4.metric("Dist max", f"{mp['max_dist']:.4f}" if mp else "N/A")
+                    if mp:
+                        st.info(f"Midpoint entre **{mp['leaf_i']}** et **{mp['leaf_j']}**")
+                    st.plotly_chart(plot_tree(r["Z"], r["pops"], r["support"],
+                                              title="UPGMA (bootstrap)",
+                                              mid=mp if ro == "Midpoint" else None),
+                                    width='stretch', key="plot_nj_tree")
+                    with st.expander("Newick"):
+                        st.code(r["newick"])
+
+            # GWAS case-control
+            st.divider()
+            st.subheader("🧬 GWAS case-control")
             covs_pair = ss.pca_s[:, :5] if (ss.pca_s is not None and len(ss.pca_s) == len(iu)) else None
-            mode_gwas = st.radio("🎯 Mode", ["🏷️ Race × Race", "📊 Groupe × Groupe", "⚖️ Comparer"], horizontal=True, key="gwas_mode"); st.divider()
+            mode_gwas = st.radio("🎯 Mode",
+                                 ["🏷️ Race × Race", "📊 Groupe × Groupe", "⚖️ Comparer"],
+                                 horizontal=True, key="gwas_mode")
+            st.divider()
+
             if mode_gwas.startswith("🏷️"):
-                races, _ = get_pairs(iu["FID"].astype(str).values); c1, c2 = st.columns(2); ra = c1.selectbox("Race A", races, index=0, key="pa"); rb = c2.selectbox("Race B", races, index=1 if len(races) > 1 else 0, key="pb")
-                c1, c2 = st.columns(2); mtd = c1.selectbox("Méthode", ["allelic", "logistic"], key="pm"); mf = c2.slider("MAF", 0.0, 0.3, 0.05, key="pmf")
-                if mtd == "allelic": st.caption("ℹ️ Le test allélique ignore la structure/parenté : λGC élevé possible ; préférez « logistic » (corrigé par 5 PCs).")
+                races, _ = get_pairs(iu["FID"].astype(str).values)
+                c1, c2 = st.columns(2)
+                ra = c1.selectbox("Race A", races, index=0, key="pa")
+                rb = c2.selectbox("Race B", races, index=1 if len(races) > 1 else 0, key="pb")
+                c1, c2 = st.columns(2)
+                mtd = c1.selectbox("Méthode", ["allelic", "logistic"], key="pm")
+                mf = c2.slider("MAF", 0.0, 0.3, 0.05, key="pmf")
+                if mtd == "allelic":
+                    st.caption("ℹ️ Test allélique = pas de correction structure → préférez 'logistic' avec 5 PCs.")
                 if ra != rb and st.button(f"🚀 {ra} vs {rb}", type="primary", key="pr_btn"):
                     try:
-                        with st.spinner(f"{ra} vs {rb}..."): ss["pair_res_race"] = gwas_pairwise(gu, su, iu["FID"].astype(str).values, ra, rb, float(mf), mtd, covs_pair); ss["pair_name_race"] = f"{ra} vs {rb}"
-                    except Exception as e: st.error(f"❌ {e}")
+                        with st.spinner(f"{ra} vs {rb}..."):
+                            ss["pair_res_race"] = gwas_pairwise(gu, su, iu["FID"].astype(str).values,
+                                                                ra, rb, float(mf), mtd, covs_pair)
+                            ss["pair_name_race"] = f"{ra} vs {rb}"
+                    except Exception as e:
+                        st.error(f"❌ {e}")
                 show_pair("pair_res_race", "pair_name_race", "plot_pair_race")
+
             elif mode_gwas.startswith("📊"):
-                critere = st.selectbox("Critère", list(GROUPES_DEFAULT.keys()) + ["➕ CSV"], key="grp_critere"); group_map = None
+                critere = st.selectbox("Critère", list(GROUPES_DEFAULT.keys()) + ["➕ CSV"], key="grp_critere")
+                group_map = None
                 if critere == "➕ CSV":
                     f = st.file_uploader("CSV (RACE, GROUPE)", type=["csv"], key="grp_csv")
                     if f is not None:
-                        mdf = pd.read_csv(io.BytesIO(f.getvalue())); group_map = dict(zip(mdf["RACE"].astype(str).str.upper(), mdf["GROUPE"].astype(str)))
-                else: group_map = make_group_map(GROUPES_DEFAULT[critere])
-                if group_map is None: st.info("Chargez un CSV avec les colonnes RACE et GROUPE.")
+                        mdf = pd.read_csv(io.BytesIO(f.getvalue()))
+                        group_map = dict(zip(mdf["RACE"].astype(str).str.upper(), mdf["GROUPE"].astype(str)))
                 else:
-                    iu_g = apply_group_mapping(iu, group_map); groups = sorted([g for g in iu_g["FID_GROUPE"].unique() if g != "AUTRE"])
-                    if len(groups) < 2: st.warning("Moins de 2 groupes reconnus : vérifiez que les FID correspondent aux races du critère.")
+                    group_map = make_group_map(GROUPES_DEFAULT[critere])
+
+                if group_map is None:
+                    st.info("Chargez un CSV avec les colonnes RACE et GROUPE.")
+                else:
+                    iu_g = apply_group_mapping(iu, group_map)
+                    groups = sorted([g for g in iu_g["FID_GROUPE"].unique() if g != "AUTRE"])
+                    if len(groups) < 2:
+                        st.warning("Moins de 2 groupes reconnus : vérifiez que les FID correspondent aux races du critère.")
                     else:
-                        c1, c2 = st.columns(2); ga = c1.selectbox("Groupe A", groups, index=0, key="grp_a"); gb = c2.selectbox("Groupe B", groups, index=1, key="grp_b"); mtd_g = c1.selectbox("Méthode", ["allelic", "logistic"], key="pm_grp"); mf_g = c2.slider("MAF", 0.0, 0.3, 0.05, key="pmf_grp")
-                        nA = (iu_g["FID_GROUPE"] == ga).sum(); nB = (iu_g["FID_GROUPE"] == gb).sum(); rA = iu_g[iu_g["FID_GROUPE"] == ga]["FID"].nunique(); rB = iu_g[iu_g["FID_GROUPE"] == gb]["FID"].nunique()
+                        c1, c2 = st.columns(2)
+                        ga = c1.selectbox("Groupe A", groups, index=0, key="grp_a")
+                        gb = c2.selectbox("Groupe B", groups, index=1, key="grp_b")
+                        mtd_g = c1.selectbox("Méthode", ["allelic", "logistic"], key="pm_grp")
+                        mf_g = c2.slider("MAF", 0.0, 0.3, 0.05, key="pmf_grp")
+                        nA = (iu_g["FID_GROUPE"] == ga).sum()
+                        nB = (iu_g["FID_GROUPE"] == gb).sum()
+                        rA = iu_g[iu_g["FID_GROUPE"] == ga]["FID"].nunique()
+                        rB = iu_g[iu_g["FID_GROUPE"] == gb]["FID"].nunique()
                         st.info(f"📊 **{ga}** ({nA} ind, {rA} races) vs **{gb}** ({nB} ind, {rB} races)")
                         if ga != gb and st.button(f"🚀 {ga} vs {gb}", type="primary", key="pr_btn_grp"):
                             try:
-                                with st.spinner(f"{ga} vs {gb}..."): ss["pair_res_group"] = gwas_pairwise_group(gu, su, iu_g["FID_GROUPE"].values, ga, gb, float(mf_g), mtd_g, covs_pair); ss["pair_name_group"] = f"{ga} vs {gb} ({critere})"
-                            except Exception as e: st.error(f"❌ {e}")
-                show_pair("pair_res_group", "pair_name_group", "plot_pair_group")
-            else:
-                res_r = ss.get("pair_res_race"); res_g = ss.get("pair_res_group")
-                if res_r is None or res_g is None or res_r.empty or res_g.empty: st.warning("⚠️ Lancez RACE puis GROUPE pour comparer.")
-                else:
-                    c1, c2 = st.columns(2); c1.metric(f"🏷️ {ss.get('pair_name_race', 'Race')}", f"{len(res_r)} SNPs", delta=f"{(res_r['P'] < 0.05 / len(res_r)).sum()} Bonf"); c2.metric(f"📊 {ss.get('pair_name_group', 'Groupe')}", f"{len(res_g)} SNPs", delta=f"{(res_g['P'] < 0.05 / len(res_g)).sum()} Bonf")
-                    common = set(res_r["SNP"]).intersection(set(res_g["SNP"])); st.metric("SNPs communs", len(common))
-                    if common:
-                        dfc = res_r[res_r["SNP"].isin(common)][["SNP", "CHR", "BP", "FST_snp", "P"]].rename(columns={"P": "P_race", "FST_snp": "FST_race"})
-                        dfc = dfc.merge(res_g[res_g["SNP"].isin(common)][["SNP", "P", "FST_snp"]].rename(columns={"P": "P_group", "FST_snp": "FST_group"}), on="SNP"); st.dataframe(dfc, width='stretch'); st.download_button("⬇ SNPs communs", dfc.to_csv(index=False).encode(), "snps_communs.csv", "text/csv")
+                                with st.spinner(f"{ga} vs {gb}..."):
+                                    ss["pair_res_group"] = gwas_pairwise_group(gu, su,
+                                                                                iu_g["FID_GROUPE"].values,
+                                                                                ga, gb, float(mf_g), mtd_g, covs_pair)
+                                    ss["pair_name_group"] = f"{ga} vs {gb} ({critere})"
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+                    show_pair("pair_res_group", "pair_name_group", "plot_pair_group")
 
-            st.divider(); st.subheader("🧬 Signatures de sélection")
-            ms = st.radio("Méthode", ["8.3.1 — FST par fenêtres", "8.3.2 — Tajima's D", "8.3.3 — CSS"], horizontal=True, key="sel_m")
+            else:  # Comparer
+                res_r = ss.get("pair_res_race"); res_g = ss.get("pair_res_group")
+                if res_r is None or res_g is None or res_r.empty or res_g.empty:
+                    st.warning("⚠️ Lancez RACE puis GROUPE pour comparer.")
+                else:
+                    c1, c2 = st.columns(2)
+                    c1.metric(f"🏷️ {ss.get('pair_name_race', 'Race')}", f"{len(res_r)} SNPs",
+                              delta=f"{(res_r['P'] < 0.05 / len(res_r)).sum()} Bonf")
+                    c2.metric(f"📊 {ss.get('pair_name_group', 'Groupe')}", f"{len(res_g)} SNPs",
+                              delta=f"{(res_g['P'] < 0.05 / len(res_g)).sum()} Bonf")
+                    common = set(res_r["SNP"]).intersection(set(res_g["SNP"]))
+                    st.metric("SNPs communs", len(common))
+                    if common:
+                        dfc = res_r[res_r["SNP"].isin(common)][["SNP", "CHR", "BP", "FST_snp", "P"]].rename(
+                            columns={"P": "P_race", "FST_snp": "FST_race"})
+                        dfc = dfc.merge(
+                            res_g[res_g["SNP"].isin(common)][["SNP", "P", "FST_snp"]].rename(
+                                columns={"P": "P_group", "FST_snp": "FST_group"}), on="SNP")
+                        st.dataframe(dfc, width='stretch')
+                        st.download_button("⬇ SNPs communs", dfc.to_csv(index=False).encode(),
+                                           "snps_communs.csv", "text/csv")
+
+            # Signatures de sélection
+            st.divider()
+            st.subheader("🧬 Signatures de sélection")
+            ms = st.radio("Méthode",
+                          ["8.3.1 — FST par fenêtres", "8.3.2 — Tajima's D", "8.3.3 — CSS"],
+                          horizontal=True, key="sel_m")
+
             if ms.startswith("8.3.1"):
-                c1, c2, c3 = st.columns(3); ws = c1.slider("Fenêtre", 10, 200, 50, key="wf"); sp = c2.slider("Pas", 5, 100, 25, key="wp"); zt = c3.slider("Seuil z", 2.0, 5.0, 3.0, 0.1, key="wz")
+                c1, c2, c3 = st.columns(3)
+                ws = c1.slider("Fenêtre", 10, 200, 50, key="wf")
+                sp = c2.slider("Pas", 5, 100, 25, key="wp")
+                zt = c3.slider("Seuil z", 2.0, 5.0, 3.0, 0.1, key="wz")
                 if st.button("▶ Scanner FST", type="primary", key="wf_btn"):
-                    with st.spinner("Scan FST..."): w = windowed_fst(gu, su, lab, ws, sp)
-                    if w.empty: st.warning("Aucune fenêtre valide (fenêtre trop grande pour le nombre de SNPs par chromosome ?).")
-                    else: ss.win_fst = detect_outliers(w, zt); st.success(f"✅ {len(w)} fenêtres · {int(ss.win_fst['OUTLIER'].sum())} outliers")
+                    with st.spinner("Scan FST..."):
+                        w = windowed_fst(gu, su, lab, ws, sp)
+                    if w.empty:
+                        st.warning("Aucune fenêtre valide.")
+                    else:
+                        ss.win_fst = detect_outliers(w, zt)
+                        st.success(f"✅ {len(w)} fenêtres · {int(ss.win_fst['OUTLIER'].sum())} outliers")
                 if ss.get("win_fst") is not None:
-                    w = ss.win_fst; fg = plot_win_manh(w, "MEAN_FST", "FST fenêtres (rapport des moyennes W&C)")
-                    if fg: st.plotly_chart(fg, width='stretch', key="plot_win_fst")
-                    st.dataframe(w.head(20)[["CHR", "START", "END", "N_SNP", "MEAN_FST", "MAX_FST", "Z_FST", "TOP_SNP"]], width='stretch')
+                    w = ss.win_fst
+                    fg = plot_win_manh(w, "MEAN_FST", "FST fenêtres")
+                    if fg:
+                        st.plotly_chart(fg, width='stretch', key="plot_win_fst")
+                    st.dataframe(w.head(20)[["CHR", "START", "END", "N_SNP", "MEAN_FST", "MAX_FST", "Z_FST", "TOP_SNP"]],
+                                 width='stretch')
+
             elif ms.startswith("8.3.2"):
-                rs = st.selectbox("Race", sorted(np.unique(lab)), key="tr"); c1, c2 = st.columns(2); wt = c1.slider("Fenêtre", 10, 100, 25, key="wt"); stp = c2.slider("Pas", 5, 50, 10, key="stp")
-                st.caption("⚠️ Sur puce SNP (biais d'ascertainment), D n'a pas sa valeur absolue : repérez les fenêtres extrêmes en relatif.")
+                rs = st.selectbox("Race", sorted(np.unique(lab)), key="tr")
+                c1, c2 = st.columns(2)
+                wt = c1.slider("Fenêtre", 10, 100, 25, key="wt")
+                stp = c2.slider("Pas", 5, 50, 10, key="stp")
+                st.caption("⚠️ Sur puce SNP, D n'a pas sa valeur absolue.")
                 if st.button(f"▶ Tajima's D — {rs}", type="primary", key="t_btn"):
                     m = lab == rs
-                    if m.sum() < 5: st.error("⚠️ < 5 individus")
+                    if m.sum() < 5:
+                        st.error("⚠️ < 5 individus")
                     else:
-                        with st.spinner("Tajima..."): t = tajimas_scan(gu[m], su, wt, stp); ss.taj_df = t; ss.taj_race = rs
+                        with st.spinner("Tajima..."):
+                            t = tajimas_scan(gu[m], su, wt, stp)
+                            ss.taj_df = t
+                            ss.taj_race = rs
                         st.success(f"✅ {len(t)} fenêtres")
                 if ss.get("taj_df") is not None and not ss.taj_df.empty:
-                    t = ss.taj_df; tv = st.selectbox("Variable à tracer", ["TAJIMA_D", "PI_PAR_SNP", "THETA_W_PAR_SNP", "PI_PAR_KB"], key="taj_var"); fg = plot_win_manh(t, tv, f"{tv} — {ss.get('taj_race', '')}")
-                    if fg: st.plotly_chart(fg, width='stretch', key="plot_tajima")
+                    t = ss.taj_df
+                    tv = st.selectbox("Variable à tracer",
+                                      ["TAJIMA_D", "PI_PAR_SNP", "THETA_W_PAR_SNP", "PI_PAR_KB"], key="taj_var")
+                    fg = plot_win_manh(t, tv, f"{tv} — {ss.get('taj_race', '')}")
+                    if fg:
+                        st.plotly_chart(fg, width='stretch', key="plot_tajima")
                     st.dataframe(t.sort_values("TAJIMA_D").head(20), width='stretch')
-            else:
+
+            else:  # CSS
                 if st.button("▶ CSS", type="primary", key="css_btn"):
-                    with st.spinner("CSS..."): ss.css_df = composite_score(gu, su, lab)
+                    with st.spinner("CSS..."):
+                        ss.css_df = composite_score(gu, su, lab)
                     st.success(f"✅ {len(ss.css_df)} SNPs")
                 if ss.get("css_df") is not None:
-                    c = ss.css_df; st.plotly_chart(plot_manhattan(c.dropna(subset=["CSS"]), yc="CSS", title="Composite Selection Signal"), width='stretch', key="plot_css_manh"); st.dataframe(c.head(20), width='stretch')
+                    c = ss.css_df
+                    st.plotly_chart(plot_manhattan(c.dropna(subset=["CSS"]), yc="CSS",
+                                                   title="Composite Selection Signal"),
+                                    width='stretch', key="plot_css_manh")
+                    st.dataframe(c.head(20), width='stretch')
 
-            st.divider(); st.subheader("🧬 Annotation des gènes (cM ou kb)")
-            snp_full = su; has_cm_data = (snp_full is not None and "CM" in snp_full.columns and not np.all(snp_full["CM"].astype(float).values == 0))
-            if has_cm_data: st.success("✅ cM valides détectées — annotation en cM disponible")
-            else: st.warning("⚠️ cM=0 → fallback kb")
-            gff_f = st.file_uploader("GFF3/GTF", type=["gff", "gff3", "gtf", "gz"], key="sel_gff_file"); sources = []
+            # Annotation gènes
+            st.divider()
+            st.subheader("🧬 Annotation des gènes (cM ou kb)")
+            snp_full = su
+            has_cm_data = (snp_full is not None and "CM" in snp_full.columns and
+                           not np.all(snp_full["CM"].astype(float).values == 0))
+            if has_cm_data:
+                st.success("✅ cM valides détectées")
+            else:
+                st.warning("⚠️ cM=0 → fallback kb")
+            gff_f = st.file_uploader("GFF3/GTF", type=["gff", "gff3", "gtf", "gz"], key="sel_gff_file")
+            sources = []
             if ss.get("win_fst") is not None: sources.append("FST outliers")
             if ss.get("taj_df") is not None and not ss.taj_df.empty: sources.append("Tajima extrêmes")
             if ss.get("css_df") is not None: sources.append("CSS top")
             if ss.get("pair_res_race") is not None and not ss.pair_res_race.empty: sources.append("Race Pairwise")
             if ss.get("pair_res_group") is not None and not ss.pair_res_group.empty: sources.append("Group Pairwise")
             sources.append("Manuel")
+
             if gff_f is not None:
                 try:
-                    gff = load_gff(gff_f.getvalue()); ss.sel_gff = gff
-                    if gff.empty: st.error("Aucun gène lu dans ce fichier (type 'gene' attendu)."); raise ValueError("GFF vide")
-                    st.success(f"✅ {len(gff)} gènes"); c1, c2 = st.columns(2); metric = c1.radio("Unité", ["cM (génétique)", "kb (physique)"], index=0 if has_cm_data else 1, horizontal=True, key="ann_metric")
-                    if metric.startswith("cM"): window_cm = c2.slider("Fenêtre cM", 1, 50, 10, 1); wk_fallback = 100
-                    else: wk_fallback = c2.slider("Fenêtre kb", 1, 500, 50, 5); window_cm = 10
-                    src = st.selectbox("Source", sources, key="ann_src"); to_ann = None
-                    if src == "FST outliers": to_ann = ss.win_fst.head(50)[["CHR", "MID", "TOP_SNP"]].rename(columns={"MID": "BP", "TOP_SNP": "SNP"})
-                    elif src == "Tajima extrêmes": ex = ss.taj_df.sort_values("TAJIMA_D").head(20); to_ann = ex[["CHR", "MID"]].rename(columns={"MID": "BP"}); to_ann["SNP"] = [f"Taj_{i + 1}" for i in range(len(to_ann))]
-                    elif src == "CSS top": to_ann = ss.css_df.head(30)[["SNP", "CHR", "BP"]]
-                    elif src in ("Race Pairwise", "Group Pairwise"): to_ann = ss["pair_res_race" if src == "Race Pairwise" else "pair_res_group"].head(30)[["SNP", "CHR", "BP"]]
-                    else: c1, c2 = st.columns(2); chm = c1.text_input("Chr", "14", key="ann_mc"); pm = c2.number_input("Pos", 0, 200_000_000, 25_000_000, 100_000, key="ann_mp"); to_ann = pd.DataFrame({"SNP": [f"m_{chm}_{pm}"], "CHR": [str(chm)], "BP": [int(pm)]})
+                    gff = load_gff(gff_f.getvalue())
+                    ss.sel_gff = gff
+                    if gff.empty:
+                        st.error("Aucun gène lu.")
+                        raise ValueError("GFF vide")
+                    st.success(f"✅ {len(gff)} gènes")
+                    c1, c2 = st.columns(2)
+                    metric = c1.radio("Unité", ["cM (génétique)", "kb (physique)"],
+                                      index=0 if has_cm_data else 1, horizontal=True, key="ann_metric")
+                    if metric.startswith("cM"):
+                        window_cm = c2.slider("Fenêtre cM", 1, 50, 10, 1)
+                        wk_fallback = 100
+                    else:
+                        wk_fallback = c2.slider("Fenêtre kb", 1, 500, 50, 5)
+                        window_cm = 10
+
+                    src = st.selectbox("Source", sources, key="ann_src")
+                    to_ann = None
+                    if src == "FST outliers":
+                        to_ann = ss.win_fst.head(50)[["CHR", "MID", "TOP_SNP"]].rename(
+                            columns={"MID": "BP", "TOP_SNP": "SNP"})
+                    elif src == "Tajima extrêmes":
+                        ex = ss.taj_df.sort_values("TAJIMA_D").head(20)
+                        to_ann = ex[["CHR", "MID"]].rename(columns={"MID": "BP"})
+                        to_ann["SNP"] = [f"Taj_{i + 1}" for i in range(len(to_ann))]
+                    elif src == "CSS top":
+                        to_ann = ss.css_df.head(30)[["SNP", "CHR", "BP"]]
+                    elif src in ("Race Pairwise", "Group Pairwise"):
+                        to_ann = ss["pair_res_race" if src == "Race Pairwise" else "pair_res_group"].head(30)[["SNP", "CHR", "BP"]]
+                    else:
+                        c1, c2 = st.columns(2)
+                        chm = c1.text_input("Chr", "14", key="ann_mc")
+                        pm = c2.number_input("Pos", 0, 200_000_000, 25_000_000, 100_000, key="ann_mp")
+                        to_ann = pd.DataFrame({"SNP": [f"m_{chm}_{pm}"], "CHR": [str(chm)], "BP": [int(pm)]})
+
                     if to_ann is not None and len(to_ann) > 0 and st.button("🔍 Annoter", type="primary", key="ann_btn"):
                         with st.spinner("Annotation..."):
-                            if metric.startswith("cM"): ann = annotate_genes_cm(to_ann, snp_full, gff, window_cm=window_cm, window_kb_fallback=wk_fallback)
+                            if metric.startswith("cM"):
+                                ann = annotate_genes_cm(to_ann, snp_full, gff,
+                                                        window_cm=window_cm, window_kb_fallback=wk_fallback)
                             else:
                                 ann = annotate_genes(to_ann, gff, wk=wk_fallback)
-                                if not ann.empty: ann["WINDOW"] = f"±{wk_fallback} kb"; ann["DIST_CM"] = None
+                                if not ann.empty:
+                                    ann["WINDOW"] = f"±{wk_fallback} kb"
+                                    ann["DIST_CM"] = None
                             ss.sel_ann = ann
                             if src == "Race Pairwise": ss.sel_ann_race = ann
                             elif src == "Group Pairwise": ss.sel_ann_group = ann
-                        if ann.empty: st.warning("Aucun gène (vérifiez la correspondance des noms de chromosomes GFF ↔ SNPs)")
-                        else: st.success(f"✅ {len(ann)} associations")
-                    if ss.get("sel_ann") is not None and len(ss.sel_ann) > 0:
-                        ann = ss.sel_ann; st.dataframe(ann, width='stretch'); st.download_button("⬇ CSV", ann.to_csv(index=False).encode(), "sel_ann.csv", "text/csv")
-                        sc = ann["SNP"].unique().tolist(); sel_s = st.selectbox("Visualiser", sc, key="ann_track"); row = ann[ann["SNP"] == sel_s].iloc[0].to_dict()
-                        si = {"SNP": row["SNP"], "CHR": row["CHR"], "BP": row.get("SNP_POS_BP", row.get("SNP_POS", 0))}; f = plot_gene_track(si, gff, int(window_cm * 10) if metric.startswith("cM") else wk_fallback)
-                        if f: st.plotly_chart(f, width='stretch', key="plot_gene_track")
-                except Exception as e:
-                    if str(e) != "GFF vide": st.error(f"❌ {e}")
-            else: st.info("💡 [GFF3 Ensembl](https://ftp.ensembl.org/pub/current_gff3/)")
+                        if ann.empty:
+                            st.warning("Aucun gène (vérifiez noms de chromosomes)")
+                        else:
+                            st.success(f"✅ {len(ann)} associations")
 
-    # ---------------- GWAS classique ----------------
+                    if ss.get("sel_ann") is not None and len(ss.sel_ann) > 0:
+                        ann = ss.sel_ann
+                        st.dataframe(ann, width='stretch')
+                        st.download_button("⬇ CSV", ann.to_csv(index=False).encode(), "sel_ann.csv", "text/csv")
+                        sc = ann["SNP"].unique().tolist()
+                        sel_s = st.selectbox("Visualiser", sc, key="ann_track")
+                        row = ann[ann["SNP"] == sel_s].iloc[0].to_dict()
+                        si = {"SNP": row["SNP"], "CHR": row["CHR"],
+                              "BP": row.get("SNP_POS_BP", row.get("SNP_POS", 0))}
+                        f = plot_gene_track(si, gff, int(window_cm * 10) if metric.startswith("cM") else wk_fallback)
+                        if f:
+                            st.plotly_chart(f, width='stretch', key="plot_gene_track")
+                except Exception as e:
+                    if str(e) != "GFF vide":
+                        st.error(f"❌ {e}")
+            else:
+                st.info("💡 [GFF3 Ensembl](https://ftp.ensembl.org/pub/current_gff3/)")
+
+    # ---------------- TAB 6 : GWAS Classique ----------------
     with tabs[6]:
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
-            st.markdown("### 1️⃣ Mapping ID (optionnel)"); mf = st.file_uploader("CSV mapping (Animal + IID)", type=["csv", "txt"], key="gwas_map")
+            st.markdown("### 1️⃣ Mapping ID (optionnel)")
+            mf = st.file_uploader("CSV mapping (Animal + IID)", type=["csv", "txt"], key="gwas_map")
             if mf is not None:
-                try: ss.mapping_df = pd.read_csv(io.BytesIO(mf.getvalue())); st.success("✅ Mapping chargé"); st.dataframe(ss.mapping_df.head(3))
-                except Exception as e: st.error(f"❌ {e}")
-            st.markdown("### 2️⃣ Phénotypes"); pf = st.file_uploader("Phénotypes", type=["csv", "txt", "gz"], key="gwas_pheno_file"); c1, c2 = st.columns(2)
+                try:
+                    ss.mapping_df = pd.read_csv(io.BytesIO(mf.getvalue()))
+                    st.success("✅ Mapping chargé")
+                    st.dataframe(ss.mapping_df.head(3))
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
+            st.markdown("### 2️⃣ Phénotypes")
+            pf = st.file_uploader("Phénotypes", type=["csv", "txt", "gz"], key="gwas_pheno_file")
+            c1, c2 = st.columns(2)
             with c1:
                 if pf and st.button("📥 Charger", key="load_ph_btn", width='stretch'):
                     try:
-                        mg, _ = match_pheno(ss.ind_filt, load_pheno(pf.getvalue(), pf.name), ss.mapping_df); ss.pheno_df = mg; tc = next((c for c in mg.columns if c not in ("FID", "IID", "Animal")), None)
+                        mg, _ = match_pheno(ss.ind_filt, load_pheno(pf.getvalue(), pf.name), ss.mapping_df)
+                        ss.pheno_df = mg
+                        tc = next((c for c in mg.columns if c not in ("FID", "IID", "Animal")), None)
                         n_ok = pd.to_numeric(mg[tc], errors="coerce").notna().sum() if tc else 0
-                        if n_ok < 10: st.error(f"⚠️ {n_ok} individus appariés (min 10).")
-                        else: st.success(f"✅ {n_ok} ind")
-                    except Exception as e: st.error(f"❌ {e}")
+                        if n_ok < 10:
+                            st.error(f"⚠️ {n_ok} individus appariés (min 10).")
+                        else:
+                            st.success(f"✅ {n_ok} ind")
+                    except Exception as e:
+                        st.error(f"❌ {e}")
             with c2:
                 if st.button("🎲 Simuler", key="sim_ph_btn", width='stretch'):
-                    ind = ss.ind_filt; n = len(ind); rng = np.random.default_rng(42)
+                    ind = ss.ind_filt; n = len(ind)
+                    rng = np.random.default_rng(42)
                     tr = (ss.pca_s[:, 0] * 2 + rng.normal(0, 0.5, n)) if (ss.pca_s is not None and len(ss.pca_s) == n) else rng.normal(0, 1, n)
-                    ss.pheno_df = pd.DataFrame({"FID": ind["FID"].values, "IID": ind["IID"].values, "trait": tr}); st.success("✅")
+                    ss.pheno_df = pd.DataFrame({"FID": ind["FID"].values, "IID": ind["IID"].values, "trait": tr})
+                    st.success("✅")
+
             if ss.pheno_df is not None and len(ss.pheno_df) == len(ss.ind_filt):
                 cols = [c for c in ss.pheno_df.columns if c not in ("FID", "IID", "Animal")]
                 if cols:
-                    pc = st.selectbox("Phénotype", cols, key="gw_pc"); ib = st.checkbox("Binaire (0/1)", key="gw_bin"); use_lmm = st.checkbox("Modèle mixte (GRM VanRaden)", value=True, key="gw_lmm"); ps = pd.to_numeric(ss.pheno_df[pc], errors="coerce"); nv = int(ps.notna().sum())
-                    if nv < 10: st.error(f"❌ {nv} valides")
+                    pc = st.selectbox("Phénotype", cols, key="gw_pc")
+                    ib = st.checkbox("Binaire (0/1)", key="gw_bin")
+                    use_lmm = st.checkbox("Modèle mixte (GRM VanRaden)", value=True, key="gw_lmm")
+                    ps = pd.to_numeric(ss.pheno_df[pc], errors="coerce")
+                    nv = int(ps.notna().sum())
+                    if nv < 10:
+                        st.error(f"❌ {nv} valides")
                     else:
                         st.info(f"✅ {nv} valides")
                         if st.button("🚀 Lancer GWAS", type="primary", key="gwas_btn"):
                             try:
-                                gg, sg, _ = work_data(); cv = ss.pca_s[:, :5] if (ss.pca_s is not None and len(ss.pca_s) == gg.shape[0]) else None
+                                gg, sg, _ = work_data()
+                                cv = ss.pca_s[:, :5] if (ss.pca_s is not None and len(ss.pca_s) == gg.shape[0]) else None
                                 with st.spinner("GWAS..."):
                                     Kg = grm_vanraden(gg) if (use_lmm and not ib) else None
-                                    r = run_gwas(gg, ps.values, Kg, cv, use_lmm=use_lmm and not ib, is_bin=ib); r = annotate_gwas(r, sg); r = postprocess_gwas(r, apply_gc=True)
-                                ss.gwas_res = r; ss.lambda_gc = lambda_gc(r["P"].values) if len(r) else np.nan
-                            except Exception as e: st.error(f"❌ {e}")
+                                    r = run_gwas(gg, ps.values, Kg, cv,
+                                                 use_lmm=use_lmm and not ib, is_bin=ib)
+                                    r = annotate_gwas(r, sg)
+                                    r = postprocess_gwas(r, apply_gc=True)
+                                ss.gwas_res = r
+                                ss.lambda_gc = lambda_gc(r["P"].values) if len(r) else np.nan
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+
             r = ss.gwas_res
             if r is not None and len(r):
-                lam = ss.lambda_gc; st.success(f"✅ {len(r)} SNPs · λGC = {lam:.3f}" if np.isfinite(lam) else f"✅ {len(r)} SNPs")
-                c1, c2, c3 = st.columns(3); c1.metric("SNPs FDR<0.05", int((r["FDR"] < 0.05).sum())); c2.metric("Bonferroni", int((r["P"] < 0.05 / len(r)).sum())); c3.metric("λGC", f"{lam:.3f}" if np.isfinite(lam) else "N/A")
-                yc_choice = st.radio("Axe -log10 P", ["P", "P_GC"] if "P_GC" in r.columns else ["P"], horizontal=True, key="manh_yc")
-                st.plotly_chart(plot_manhattan(r, yc=yc_choice, title="Manhattan", thr=-np.log10(0.05 / len(r))), width='stretch', key="plot_gwas_manh_classic"); st.plotly_chart(plot_qq(r["P"].values), width='stretch', key="plot_gwas_qq")
-                show_cols = [c for c in ["SNP", "CHR", "BP", "MAF", "BETA", "SE", "T", "P", "FDR"] if c in r.columns]; st.dataframe(r[show_cols].head(20), width='stretch'); st.download_button("⬇ CSV GWAS", r.to_csv(index=False).encode(), "gwas.csv", "text/csv")
-            elif r is not None: st.warning("Aucun SNP testable (MAF/missing trop stricts ?).")
+                lam = ss.lambda_gc
+                st.success(f"✅ {len(r)} SNPs · λGC = {lam:.3f}" if np.isfinite(lam) else f"✅ {len(r)} SNPs")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("SNPs FDR<0.05", int((r["FDR"] < 0.05).sum()))
+                c2.metric("Bonferroni", int((r["P"] < 0.05 / len(r)).sum()))
+                c3.metric("λGC", f"{lam:.3f}" if np.isfinite(lam) else "N/A")
+                yc_choice = st.radio("Axe -log10 P",
+                                     ["P", "P_GC"] if "P_GC" in r.columns else ["P"],
+                                     horizontal=True, key="manh_yc")
+                st.plotly_chart(plot_manhattan(r, yc=yc_choice, title="Manhattan",
+                                               thr=-np.log10(0.05 / len(r))),
+                                width='stretch', key="plot_gwas_manh_classic")
+                st.plotly_chart(plot_qq(r["P"].values), width='stretch', key="plot_gwas_qq")
+                show_cols = [c for c in ["SNP", "CHR", "BP", "MAF", "BETA", "SE", "T", "P", "FDR"] if c in r.columns]
+                st.dataframe(r[show_cols].head(20), width='stretch')
+                st.download_button("⬇ CSV GWAS", r.to_csv(index=False).encode(), "gwas.csv", "text/csv")
+            elif r is not None:
+                st.warning("Aucun SNP testable (MAF/missing trop stricts ?).")
 
-    # ---------------- Post-GWAS ----------------
+    # ---------------- TAB 7 : Post-GWAS ----------------
     with tabs[7]:
         if ss.gwas_res is not None and len(ss.gwas_res):
-            st.subheader("🎯 Fine-mapping (ABF de Wakefield / PIP)"); wmb = st.slider("Fenêtre autour du SNP principal (± Mb)", 0.1, 5.0, 1.0, 0.1, key="fm_win")
+            st.subheader("🎯 Fine-mapping (ABF de Wakefield / PIP)")
+            wmb = st.slider("Fenêtre autour du SNP principal (± Mb)", 0.1, 5.0, 1.0, 0.1, key="fm_win")
             pip = fine_mapping(ss.gwas_res, window_mb=wmb)
-            if pip.empty: st.warning("Pas de SNP exploitable (BETA/SE manquants).")
+            if pip.empty:
+                st.warning("Pas de SNP exploitable (BETA/SE manquants).")
             else:
-                st.caption(f"{len(pip)} SNPs dans la fenêtre (CHR {pip['CHR'].iloc[0]}) · hypothèse : un seul variant causal.")
-                st.dataframe(pip[["SNP", "CHR", "BP", "P", "PIP", "CUM_PIP"]].head(15), width='stretch'); st.plotly_chart(plot_pip(pip), width='stretch', key="plot_pip_postgwas")
+                st.caption(f"{len(pip)} SNPs dans la fenêtre (CHR {pip['CHR'].iloc[0]})")
+                st.dataframe(pip[["SNP", "CHR", "BP", "P", "PIP", "CUM_PIP"]].head(15), width='stretch')
+                st.plotly_chart(plot_pip(pip), width='stretch', key="plot_pip_postgwas")
                 st.info(f"Ensemble de crédibilité à 95 % : **{int((pip['CUM_PIP'].shift(fill_value=0) < 0.95).sum())}** SNP(s)")
-        else: st.warning("Lancez GWAS d'abord")
+        else:
+            st.warning("Lancez GWAS d'abord")
 
-    # ---------------- GBLUP ----------------
+    # ---------------- TAB 8 : GBLUP ----------------
     with tabs[8]:
         if ss.pheno_df is not None and ss.gt_filt is not None and len(ss.pheno_df) == len(ss.ind_filt):
-            cols = [c for c in ss.pheno_df.columns if c not in ("FID", "IID", "Animal")]; pc = st.selectbox("Phénotype GBLUP", cols, key="gb_pc")
+            cols = [c for c in ss.pheno_df.columns if c not in ("FID", "IID", "Animal")]
+            pc = st.selectbox("Phénotype GBLUP", cols, key="gb_pc")
             if st.button("▶ GBLUP + validation", key="gb_btn"):
                 try:
-                    gu, _, iu = work_data(); ps = pd.to_numeric(ss.pheno_df[pc], errors="coerce")
-                    with st.spinner("ML + validation croisée..."): df, st_ = run_gblup(gu, ps.values, ids=iu["IID"].values)
-                    ss.gebv_df = df; ss.gblup_stats = st_
-                except Exception as e: st.error(f"❌ {e}")
-            if ss.gebv_df is not None: st.plotly_chart(plot_gblup(ss.gebv_df), width='stretch', key="plot_gblup"); st.json(ss.gblup_stats)
-        else: st.warning("Chargez les phénotypes (onglet GWAS Classique)")
+                    gu, _, iu = work_data()
+                    ps = pd.to_numeric(ss.pheno_df[pc], errors="coerce")
+                    with st.spinner("ML + validation croisée..."):
+                        df, st_ = run_gblup(gu, ps.values, ids=iu["IID"].values)
+                    ss.gebv_df = df
+                    ss.gblup_stats = st_
+                except Exception as e:
+                    st.error(f"❌ {e}")
+            if ss.gebv_df is not None:
+                st.plotly_chart(plot_gblup(ss.gebv_df), width='stretch', key="plot_gblup")
+                st.json(ss.gblup_stats)
+        else:
+            st.warning("Chargez les phénotypes (onglet GWAS Classique)")
 
-    # ---------------- Annotation dédiée ----------------
+    # ---------------- TAB 9 : Annotation dédiée ----------------
     with tabs[9]:
-        gff_f = st.file_uploader("GFF3/GTF", type=["gff", "gff3", "gtf", "gz"], key="ann_ded_gff"); src = st.radio("Source", ["Sélection", "GWAS"], horizontal=True, key="ann_ded_src"); wk = st.slider("Fenêtre kb", 1, 500, 50, key="ann_ded_wk")
+        st.subheader("🧬 Annotation fonctionnelle dédiée")
+        gff_f = st.file_uploader("GFF3/GTF", type=["gff", "gff3", "gtf", "gz"], key="ann_ded_gff")
+        src = st.radio("Source", ["Sélection", "GWAS"], horizontal=True, key="ann_ded_src")
+        wk = st.slider("Fenêtre kb", 1, 500, 50, key="ann_ded_wk")
+
         if gff_f:
             try:
-                gff = load_gff(gff_f.getvalue()); st.success(f"✅ {len(gff)} gènes"); snps = None
-                if src == "Sélection" and ss.win_fst is not None: snps = ss.win_fst.head(20).rename(columns={"MID": "BP", "TOP_SNP": "SNP"})[["SNP", "CHR", "BP"]]
-                elif src == "GWAS" and ss.gwas_res is not None: snps = ss.gwas_res.sort_values("P").head(20)[["SNP", "CHR", "BP"]]
-                if snps is not None and st.button("🔍 Annoter", key="ann_ded_btn"): ss.ann_df = annotate_genes(snps, gff, wk); st.success("✅")
-                if ss.ann_df is not None: st.dataframe(ss.ann_df, width='stretch')
-            except Exception as e: st.error(f"❌ {e}")
+                gff = load_gff(gff_f.getvalue())
+                st.success(f"✅ {len(gff)} gènes")
+                snps = None
+                if src == "Sélection" and ss.win_fst is not None:
+                    snps = ss.win_fst.head(20).rename(columns={"MID": "BP", "TOP_SNP": "SNP"})[["SNP", "CHR", "BP"]]
+                elif src == "GWAS" and ss.gwas_res is not None:
+                    snps = ss.gwas_res.sort_values("P").head(20)[["SNP", "CHR", "BP"]]
 
-    # ---------------- VEP & NCBI ----------------
+                if snps is not None and st.button("🔍 Annoter", key="ann_ded_btn"):
+                    ss.ann_df = annotate_genes(snps, gff, wk)
+                    st.success("✅")
+
+                if ss.ann_df is not None:
+                    st.dataframe(ss.ann_df, width='stretch')
+                    st.download_button("⬇ CSV", ss.ann_df.to_csv(index=False).encode(),
+                                       "ann_ded.csv", "text/csv")
+            except Exception as e:
+                st.error(f"❌ {e}")
+
+    # ---------------- TAB 10 : VEP & NCBI ----------------
     with tabs[10]:
-        st.subheader("🧬 Annotation Fonctionnelle (VEP & NCBI)"); sources_snp = []
-        if ss.get("pair_res_group") is not None and not ss.pair_res_group.empty: sources_snp.append("Top SNPs Groupe")
-        if ss.get("pair_res_race") is not None and not ss.pair_res_race.empty: sources_snp.append("Top SNPs Race")
-        if ss.get("gwas_res") is not None and len(ss.gwas_res): sources_snp.append("Top SNPs GWAS")
-        if ss.get("win_fst") is not None and not ss.win_fst.empty: sources_snp.append("Top SNPs FST")
-        sources_snp.append("Saisie manuelle"); src_snp = st.selectbox("Source des SNPs", sources_snp, key="vep_src"); snps_to_analyze = []
-        if src_snp == "Top SNPs Groupe": snps_to_analyze = ss.pair_res_group["SNP"].head(20).tolist()
-        elif src_snp == "Top SNPs Race": snps_to_analyze = ss.pair_res_race["SNP"].head(20).tolist()
-        elif src_snp == "Top SNPs GWAS": snps_to_analyze = ss.gwas_res.sort_values("P")["SNP"].head(20).tolist()
-        elif src_snp == "Top SNPs FST": snps_to_analyze = ss.win_fst["TOP_SNP"].head(20).tolist()
+        st.subheader("🧬 Annotation Fonctionnelle (VEP & NCBI)")
+
+        # Sources de SNPs
+        sources_snp = []
+        if ss.get("pair_res_group") is not None and not ss.pair_res_group.empty:
+            sources_snp.append("Top SNPs Groupe")
+        if ss.get("pair_res_race") is not None and not ss.pair_res_race.empty:
+            sources_snp.append("Top SNPs Race")
+        if ss.get("gwas_res") is not None and len(ss.gwas_res):
+            sources_snp.append("Top SNPs GWAS")
+        if ss.get("win_fst") is not None and not ss.win_fst.empty:
+            sources_snp.append("Top SNPs FST")
+        sources_snp.append("Saisie manuelle")
+
+        src_snp = st.selectbox("Source des SNPs", sources_snp, key="vep_src")
+        snps_to_analyze = []
+        if src_snp == "Top SNPs Groupe":
+            snps_to_analyze = ss.pair_res_group["SNP"].head(20).tolist()
+        elif src_snp == "Top SNPs Race":
+            snps_to_analyze = ss.pair_res_race["SNP"].head(20).tolist()
+        elif src_snp == "Top SNPs GWAS":
+            snps_to_analyze = ss.gwas_res.sort_values("P")["SNP"].head(20).tolist()
+        elif src_snp == "Top SNPs FST":
+            snps_to_analyze = ss.win_fst["TOP_SNP"].head(20).tolist()
         else:
             txt = st.text_area("Liste de SNPs (1/ligne)", key="vep_manual")
-            if txt.strip(): snps_to_analyze = [s.strip() for s in txt.splitlines() if s.strip()]
+            if txt.strip():
+                snps_to_analyze = [s.strip() for s in txt.splitlines() if s.strip()]
+
         if snps_to_analyze:
-            st.info(f"📊 {len(snps_to_analyze)} SNPs sélectionnés."); snp_full = ss.snp_filt if ss.snp_filt is not None else ss.snp_df; items = []; approx = 0; ACGT = ("A", "C", "G", "T")
+            st.info(f"📊 {len(snps_to_analyze)} SNPs sélectionnés.")
+            snp_full = ss.snp_filt if ss.snp_filt is not None else ss.snp_df
+            items = []
+            approx = 0
+            ACGT = ("A", "C", "G", "T")
             for s in snps_to_analyze:
                 s = str(s)
-                if s.lower().startswith("rs"): items.append((s, "id", s)); continue
+                if s.lower().startswith("rs"):
+                    items.append((s, "id", s))
+                    continue
                 row = snp_full[snp_full["SNP"].astype(str) == s] if snp_full is not None else pd.DataFrame()
-                if row.empty: continue
-                r = row.iloc[0]; a1 = str(r.get("A1", ".")); a2 = str(r.get("A2", "."))
-                if a1 not in ACGT or a2 not in ACGT: a1, a2 = "A", "G"; approx += 1
+                if row.empty:
+                    continue
+                r = row.iloc[0]
+                a1 = str(r.get("A1", ".")); a2 = str(r.get("A2", "."))
+                if a1 not in ACGT or a2 not in ACGT:
+                    a1, a2 = "A", "G"; approx += 1
                 items.append((s, "region", f"{r['CHR']} {int(r['BP'])} {int(r['BP'])} {a1}/{a2} 1"))
-            if approx: st.caption(f"ℹ️ {approx} SNP(s) sans allèles A/C/G/T connus : conséquence positionnelle approximative (allèles A/G fictifs).")
-            st.caption("ℹ️ Les coordonnées doivent correspondre à l'assemblage interrogé par Ensembl (ARS-UCD1.2 pour le bovin actuel) ; sinon convertissez d'abord.")
+
+            if approx:
+                st.caption(f"ℹ️ {approx} SNP(s) avec allèles non-ACGT : conséquence positionnelle approximative.")
+            st.caption("ℹ️ Les coordonnées doivent correspondre à l'assemblage Ensembl (ARS-UCD1.2 pour bovin).")
+
             if st.button("🔬 Lancer VEP", type="primary", key="run_vep_btn"):
                 with st.spinner("Interrogation Ensembl VEP..."):
                     vep_res = run_vep_api(items, VEP_SPECIES)
-                if vep_res.empty: st.warning("VEP n'a retourné aucun résultat.")
-                else: vep_res["LOCALISATION"] = vep_res["CONSEQUENCE"].apply(traduire_consequence_vep); ss.vep_res = vep_res; st.success("✅ VEP terminé.")
-            if ss.get("vep_res") is not None and not ss.vep_res.empty:
-                st.dataframe(ss.vep_res[["SNP", "GENE", "LOCALISATION", "CONSEQUENCE", "IMPACT", "AMINO_ACID_CHANGE"]], width='stretch'); st.download_button("⬇ CSV VEP", ss.vep_res.to_csv(index=False).encode(), "vep_results.csv", "text/csv")
-            st.markdown("### NCBI Gene"); genes_to_fetch = []
-            if ss.get("vep_res") is not None and "GENE" in ss.vep_res.columns: genes_to_fetch = ss.vep_res["GENE"].dropna().unique().tolist()
-            elif ss.get("sel_ann") is not None and "GENE" in ss.sel_ann.columns: genes_to_fetch = ss.sel_ann["GENE"].dropna().unique().tolist()
-            genes_to_fetch = [g for g in genes_to_fetch if str(g).strip() not in ("N/A", "Intergenic/Non-codant", "Région régulatrice", "Unknown", "nan", "")]
-            if genes_to_fetch:
-                st.info(f"🧬 {len(genes_to_fetch)} gènes valides.")
-                if st.button("🏛️ Récupérer NCBI", type="primary", key="run_ncbi_btn"):
-                    with st.spinner("NCBI Datasets..."): ss.ncbi_gene_res = fetch_ncbi_gene_info(genes_to_fetch[:20], TAXON)
-                if ss.get("ncbi_gene_res") is not None and not ss.ncbi_gene_res.empty:
-                    st.dataframe(ss.ncbi_gene_res, width='stretch'); st.download_button("⬇ CSV NCBI", ss.ncbi_gene_res.to_csv(index=False).encode(), "ncbi_gene_info.csv", "text/csv")
+                if vep_res.empty:
+                    st.warning("VEP n'a retourné aucun résultat.")
+                else:
+                    vep_res["LOCALISATION"] = vep_res["CONSEQUENCE"].apply(traduire_consequence_vep)
+                    ss.vep_res = vep_res
+                    st.success("✅ VEP terminé.")
 
-    # ---------------- Structure 3D ----------------
+            if ss.get("vep_res") is not None and not ss.vep_res.empty:
+                st.dataframe(ss.vep_res[["SNP", "GENE", "LOCALISATION", "CONSEQUENCE", "IMPACT", "AMINO_ACID_CHANGE"]],
+                             width='stretch')
+                st.download_button("⬇ CSV VEP", ss.vep_res.to_csv(index=False).encode(),
+                                   "vep_results.csv", "text/csv")
+
+        # NCBI Gene
+        st.markdown("### NCBI Gene")
+        genes_to_fetch = []
+        if ss.get("vep_res") is not None and "GENE" in ss.vep_res.columns:
+            genes_to_fetch = ss.vep_res["GENE"].dropna().unique().tolist()
+        elif ss.get("sel_ann") is not None and "GENE" in ss.sel_ann.columns:
+            genes_to_fetch = ss.sel_ann["GENE"].dropna().unique().tolist()
+        genes_to_fetch = [g for g in genes_to_fetch if str(g).strip() not in
+                          ("N/A", "Intergenic/Non-codant", "Région régulatrice", "Unknown", "nan", "")]
+
+        if genes_to_fetch:
+            st.info(f"🧬 {len(genes_to_fetch)} gènes valides.")
+            if st.button("🏛️ Récupérer NCBI", type="primary", key="run_ncbi_btn"):
+                with st.spinner("NCBI Datasets..."):
+                    ss.ncbi_gene_res = fetch_ncbi_gene_info(genes_to_fetch[:20], TAXON)
+            if ss.get("ncbi_gene_res") is not None and not ss.ncbi_gene_res.empty:
+                st.dataframe(ss.ncbi_gene_res, width='stretch')
+                st.download_button("⬇ CSV NCBI", ss.ncbi_gene_res.to_csv(index=False).encode(),
+                                   "ncbi_gene_info.csv", "text/csv")
+
+    # ---------------- TAB 11 : Structure 3D ----------------
     with tabs[11]:
-        st.subheader("🧬 AlphaFold — Visualisation 3D"); genes_to_structure = []
+        st.subheader("🧬 AlphaFold — Visualisation 3D")
+        genes_to_structure = []
         for key in ("vep_res", "sel_ann", "ann_df"):
             v = ss.get(key)
             if v is not None and hasattr(v, "columns") and "GENE" in v.columns and not v.empty:
-                genes_to_structure = [g for g in v["GENE"].unique() if str(g).strip() not in ("N/A", "Intergenic/Non-codant", "Région régulatrice", "Unknown", "nan", "")]
-                if genes_to_structure: break
-        if not genes_to_structure: st.warning("⚠️ Lancez d'abord VEP ou Annotation.")
+                genes_to_structure = [g for g in v["GENE"].unique()
+                                      if str(g).strip() not in ("N/A", "Intergenic/Non-codant",
+                                                                 "Région régulatrice", "Unknown", "nan", "")]
+                if genes_to_structure:
+                    break
+
+        if not genes_to_structure:
+            st.warning("⚠️ Lancez d'abord VEP ou Annotation.")
         else:
-            c1, c2, c3 = st.columns(3); target_gene = c1.selectbox("Gène", genes_to_structure, key="gene_3d"); view_style = c2.selectbox("Style", ["cartoon", "stick", "sphere", "line"], key="style_3d"); color_scheme = c3.selectbox("Coloration", ["spectrum", "chainHetatm", "ssPyMol"], key="color_3d"); highlight_res = st.text_input("Surligner résidu (ex: 123)", key="hl_res")
+            c1, c2, c3 = st.columns(3)
+            target_gene = c1.selectbox("Gène", genes_to_structure, key="gene_3d")
+            view_style = c2.selectbox("Style", ["cartoon", "stick", "sphere", "line"], key="style_3d")
+            color_scheme = c3.selectbox("Coloration", ["spectrum", "chainHetatm", "ssPyMol"], key="color_3d")
+            highlight_res = st.text_input("Surligner résidu (ex: 123)", key="hl_res")
+
             if st.button("🔬 Charger 3D", type="primary", key="btn_load_3d"):
                 with st.spinner(f"Recherche pour {target_gene}..."):
                     uid = fetch_uniprot_id(target_gene, TAXON)
                     if uid:
                         pdb = fetch_alphafold_pdb(uid)
-                        if pdb: ss.pdb_gene = target_gene; ss.pdb_data = pdb; st.success(f"✅ UniProt : {uid}")
-                        else: st.error("❌ AlphaFold introuvable.")
-                    else: st.error("❌ Gène non trouvé dans UniProt.")
-            if ss.pdb_data and ss.pdb_gene == target_gene: st.info("💡 Cliquer-glisser pour tourner, molette pour zoomer."); render_3d_structure(ss.pdb_data, style=view_style, color_scheme=color_scheme, highlight_res=highlight_res)
+                        if pdb:
+                            ss.pdb_gene = target_gene
+                            ss.pdb_data = pdb
+                            st.success(f"✅ UniProt : {uid}")
+                        else:
+                            st.error("❌ AlphaFold introuvable.")
+                    else:
+                        st.error("❌ Gène non trouvé dans UniProt.")
 
-    # ---------------- Alignement ----------------
+            if ss.pdb_data and ss.pdb_gene == target_gene:
+                st.info("💡 Cliquer-glisser pour tourner, molette pour zoomer.")
+                render_3d_structure(ss.pdb_data, style=view_style,
+                                    color_scheme=color_scheme, highlight_res=highlight_res)
+
+    # ---------------- TAB 12 : Alignement ----------------
     with tabs[12]:
         st.subheader("🧬 Illustration allélique autour d'un SNP")
-        if not HAS_BIO: st.error("⚠️ Biopython requis : `pip install biopython`")
+        if not HAS_BIO:
+            st.error("⚠️ Biopython requis : `pip install biopython`")
         else:
-            cand = [("pair_res_group", ss.get("pair_res_group")), ("pair_res_race", ss.get("pair_res_race")), ("gwas_res", ss.get("gwas_res"))]
+            cand = [("pair_res_group", ss.get("pair_res_group")),
+                    ("pair_res_race", ss.get("pair_res_race")),
+                    ("gwas_res", ss.get("gwas_res"))]
             snps_to_align = next((d.head(10) for _, d in cand if d is not None and len(d)), None)
             if snps_to_align is not None:
-                st.caption("Séquence de référence Ensembl avec substitution de l'allèle du SNP (illustration, ce n'est PAS un alignement de séquences réelles de groupes).")
+                st.caption("Séquence de référence Ensembl avec substitution allélique (illustration).")
                 snp_to_choose = st.selectbox("SNP à visualiser :", snps_to_align["SNP"].tolist())
                 if st.button("🔍 Générer l'alignement", type="primary", key="aln_btn"):
-                    snp_info = snps_to_align[snps_to_align["SNP"] == snp_to_choose].iloc[0]; chrom = str(snp_info["CHR"]); bp = int(snp_info["BP"]); start = max(1, bp - 25); end = bp + 25
-                    with st.spinner(f"Téléchargement CHR{chrom}:{start}-{end}..."): seq_ref = fetch_ensembl_sequence(chrom, start, end, VEP_SPECIES)
+                    snp_info = snps_to_align[snps_to_align["SNP"] == snp_to_choose].iloc[0]
+                    chrom = str(snp_info["CHR"]); bp = int(snp_info["BP"])
+                    start = max(1, bp - 25); end = bp + 25
+                    with st.spinner(f"Téléchargement CHR{chrom}:{start}-{end}..."):
+                        seq_ref = fetch_ensembl_sequence(chrom, start, end, VEP_SPECIES)
                     if seq_ref and len(seq_ref) > bp - start:
-                        pos = bp - start; ref_b = seq_ref[pos]; row = ss.snp_filt[ss.snp_filt["SNP"].astype(str) == str(snp_to_choose)]
-                        al = [a for a in ((str(row.iloc[0].get("A1", ".")), str(row.iloc[0].get("A2", "."))) if not row.empty else ()) if a in ("A", "C", "G", "T") and a != ref_b]
-                        alt_b = al[0] if al else ("A" if ref_b != "A" else "G"); sa = list(seq_ref); sa[pos] = alt_b
-                        st.markdown(align_and_highlight(seq_ref, "".join(sa), seq_ref, f"Allèle {alt_b}", f"Allèle {ref_b}"), unsafe_allow_html=True)
-                    else: st.error("❌ Ensembl n'a pas retourné la séquence.")
-            else: st.warning("⚠️ Lancez d'abord un GWAS ou une analyse Groupe/Race.")
+                        pos = bp - start
+                        ref_b = seq_ref[pos]
+                        row = ss.snp_filt[ss.snp_filt["SNP"].astype(str) == str(snp_to_choose)]
+                        al = [a for a in ((str(row.iloc[0].get("A1", ".")),
+                                           str(row.iloc[0].get("A2", "."))) if not row.empty else ())
+                              if a in ("A", "C", "G", "T") and a != ref_b]
+                        alt_b = al[0] if al else ("A" if ref_b != "A" else "G")
+                        sa = list(seq_ref); sa[pos] = alt_b
+                        st.markdown(align_and_highlight(seq_ref, "".join(sa), seq_ref,
+                                                        f"Allèle {alt_b}", f"Allèle {ref_b}"),
+                                    unsafe_allow_html=True)
+                    else:
+                        st.error("❌ Ensembl n'a pas retourné la séquence.")
+            else:
+                st.warning("⚠️ Lancez d'abord un GWAS ou une analyse Groupe/Race.")
 
-    # ---------------- Export ----------------
+    # ---------------- TAB 13 : Export ----------------
     with tabs[13]:
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
             gu, su, iu = work_data()
             if st.button("📦 Préparer PLINK", key="pl_btn"):
-                try: ss._plink = build_plink(gu, iu, su, PREFIX)
-                except Exception as e: st.error(f"❌ {e}")
-            if ss._plink: st.download_button("⬇ PLINK (.bed/.bim/.fam)", ss._plink, f"{PREFIX}.zip", "application/zip")
-            if st.button("📄 Préparer VCF", key="vcf_btn"):
-                try: ss._vcf = build_vcf(gu, iu, su, PREFIX).encode()
-                except Exception as e: st.error(f"❌ {e}")
-            if ss._vcf: st.download_button("⬇ VCF", ss._vcf, f"{PREFIX}.vcf", "text/plain")
+                try:
+                    ss._plink = build_plink(gu, iu, su, PREFIX)
+                except Exception as e:
+                    st.error(f"❌ {e}")
+            if ss._plink:
+                st.download_button("⬇ PLINK (.bed/.bim/.fam)", ss._plink, f"{PREFIX}.zip", "application/zip")
 
-    # ---------------- Méta-analyse ----------------
+            if st.button("📄 Préparer VCF", key="vcf_btn"):
+                try:
+                    ss._vcf = build_vcf(gu, iu, su, PREFIX).encode()
+                except Exception as e:
+                    st.error(f"❌ {e}")
+            if ss._vcf:
+                st.download_button("⬇ VCF", ss._vcf, f"{PREFIX}.vcf", "text/plain")
+
+    # ---------------- TAB 14 : Méta-analyse ----------------
     with tabs[14]:
-        st.subheader("🔬 Méta-analyse & Enrichissement"); st.markdown("## 1️⃣ Permutation GWAS")
+        st.subheader("🔬 Méta-analyse & Enrichissement")
+
+        # 1. Permutation GWAS
+        st.markdown("## 1️⃣ Permutation GWAS")
         if ss.gt_filt is not None:
-            gu_perm, su_perm, iu_perm = work_data(); races_perm, _ = get_pairs(iu_perm["FID"].astype(str).values)
-            c1, c2 = st.columns(2); ra_p = c1.selectbox("Race A", races_perm, index=0, key="perm_ra"); rb_p = c2.selectbox("Race B", races_perm, index=1 if len(races_perm) > 1 else 0, key="perm_rb")
-            c1, c2 = st.columns(2); n_perm = c1.slider("N permutations", 50, 1000, 100, 50, key="perm_n"); maf_p = c2.slider("MAF", 0.0, 0.3, 0.05, key="perm_maf")
+            gu_perm, su_perm, iu_perm = work_data()
+            races_perm, _ = get_pairs(iu_perm["FID"].astype(str).values)
+            c1, c2 = st.columns(2)
+            ra_p = c1.selectbox("Race A", races_perm, index=0, key="perm_ra")
+            rb_p = c2.selectbox("Race B", races_perm, index=1 if len(races_perm) > 1 else 0, key="perm_rb")
+            c1, c2 = st.columns(2)
+            n_perm = c1.slider("N permutations", 50, 1000, 100, 50, key="perm_n")
+            maf_p = c2.slider("MAF", 0.0, 0.3, 0.05, key="perm_maf")
+
             if ra_p != rb_p and st.button("🧪 Permutation test", type="primary", key="perm_btn"):
                 try:
-                    with st.spinner(f"{n_perm} permutations..."): ss.perm_res = permutation_test_race(gu_perm, su_perm, iu_perm["FID"].astype(str).values, ra_p, rb_p, n_perm=n_perm, maf_min=float(maf_p))
-                except Exception as e: st.error(f"❌ {e}")
+                    with st.spinner(f"{n_perm} permutations..."):
+                        ss.perm_res = permutation_test_race(gu_perm, su_perm, iu_perm["FID"].astype(str).values,
+                                                            ra_p, rb_p, n_perm=n_perm, maf_min=float(maf_p))
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
             if ss.perm_res is not None:
                 orig, p_emp, n_obs, perm_counts, p_min = ss.perm_res
-                if orig.empty: st.warning("Aucun SNP testé.")
+                if orig.empty:
+                    st.warning("Aucun SNP testé.")
                 else:
-                    c1, c2, c3 = st.columns(3); c1.metric("SNPs Bonferroni observés", n_obs); c2.metric("p empirique (nb SNPs)", f"{p_emp:.4f}"); c3.metric("p empirique (min P)", f"{p_min:.4f}")
-                    st.plotly_chart(px.histogram(x=perm_counts, nbins=20, labels={"x": "Nb SNPs significatifs"}, title="Distribution nulle"), width='stretch', key="perm_hist")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("SNPs Bonferroni observés", n_obs)
+                    c2.metric("p empirique (nb SNPs)", f"{p_emp:.4f}")
+                    c3.metric("p empirique (min P)", f"{p_min:.4f}")
+                    st.plotly_chart(px.histogram(x=perm_counts, nbins=20,
+                                                 labels={"x": "Nb SNPs significatifs"},
+                                                 title="Distribution nulle"),
+                                    width='stretch', key="perm_hist")
 
-        st.divider(); st.markdown("## 2️⃣ Combinaison P-values"); res_r = ss.get("pair_res_race"); res_g = ss.get("pair_res_group")
-        if res_r is None or res_g is None or res_r.empty or res_g.empty: st.warning("⚠️ Lancez RACE puis GROUPE.")
+        # 2. Combinaison P-values
+        st.divider()
+        st.markdown("## 2️⃣ Combinaison P-values")
+        res_r = ss.get("pair_res_race"); res_g = ss.get("pair_res_group")
+        if res_r is None or res_g is None or res_r.empty or res_g.empty:
+            st.warning("⚠️ Lancez RACE puis GROUPE.")
         else:
-            st.caption("⚠️ Les deux analyses réutilisent les mêmes individus : les p-values ne sont pas indépendantes, la p combinée est indicative (anti-conservative).")
-            method = st.radio("Méthode", ["Fisher", "Stouffer pondéré"], horizontal=True, key="meta_meth")
+            st.caption("⚠️ Analyses sur les mêmes individus → p combinée indicative.")
+            method = st.radio("Méthode", ["Fisher", "Stouffer pondéré"],
+                              horizontal=True, key="meta_meth")
             if st.button("🧪 Combiner", type="primary", key="meta_btn"):
-                if method == "Fisher": ss.meta_res = combine_pvalues_fisher(res_r, res_g)
-                else: ss.meta_res = combine_stouffer(res_r, res_g, int(res_r["n_A"].max() + res_r["n_B"].max()), int(res_g["n_A"].max() + res_g["n_B"].max()))
+                if method == "Fisher":
+                    ss.meta_res = combine_pvalues_fisher(res_r, res_g)
+                else:
+                    ss.meta_res = combine_stouffer(res_r, res_g,
+                                                    int(res_r["n_A"].max() + res_r["n_B"].max()),
+                                                    int(res_g["n_A"].max() + res_g["n_B"].max()))
             if ss.meta_res is not None:
-                fish = ss.meta_res; st.success(f"✅ {len(fish)} SNPs combinés"); st.dataframe(fish.head(30), width='stretch')
-                st.plotly_chart(px.scatter(fish, x="P_race", y="P_group", hover_data=["SNP"], log_x=True, log_y=True, title="P_race vs P_group"), width='stretch', key="fisher_scatter"); st.download_button("⬇ CSV", fish.to_csv(index=False).encode(), "meta_analysis.csv", "text/csv")
+                fish = ss.meta_res
+                st.success(f"✅ {len(fish)} SNPs combinés")
+                st.dataframe(fish.head(30), width='stretch')
+                st.plotly_chart(px.scatter(fish, x="P_race", y="P_group", hover_data=["SNP"],
+                                           log_x=True, log_y=True, title="P_race vs P_group"),
+                                width='stretch', key="fisher_scatter")
+                st.download_button("⬇ CSV", fish.to_csv(index=False).encode(),
+                                   "meta_analysis.csv", "text/csv")
 
-        st.divider(); st.markdown("## 3️⃣ Enrichissement fonctionnel"); sources_genes = []
+        # 3. Enrichissement fonctionnel
+        st.divider()
+        st.markdown("## 3️⃣ Enrichissement fonctionnel")
+        sources_genes = []
         if ss.get("sel_ann_race") is not None: sources_genes.append("Gènes SNPs Race")
         if ss.get("sel_ann_group") is not None: sources_genes.append("Gènes SNPs Groupe")
         if ss.get("sel_ann") is not None: sources_genes.append("Gènes annotés (sel_ann)")
         if ss.get("vep_res") is not None: sources_genes.append("Gènes VEP")
         sources_genes.append("Liste manuelle")
-        c1, c2 = st.columns(2); src_g = c1.selectbox("Source gènes", sources_genes, key="enr_src"); outdir = c2.text_input("Dossier sortie", "", key="enr_outdir"); gmt_file = st.file_uploader("GMT (optionnel)", type=["gmt"], key="enr_gmt"); gene_sets = None
-        if gmt_file is not None: gene_sets = parse_gmt(gmt_file.getvalue()); st.success(f"✅ {len(gene_sets)} gene sets")
-        genes_to_enrich = None; src_df = {"Gènes SNPs Race": ss.get("sel_ann_race"), "Gènes SNPs Groupe": ss.get("sel_ann_group"), "Gènes annotés (sel_ann)": ss.get("sel_ann"), "Gènes VEP": ss.get("vep_res")}.get(src_g)
+
+        c1, c2 = st.columns(2)
+        src_g = c1.selectbox("Source gènes", sources_genes, key="enr_src")
+        outdir = c2.text_input("Dossier sortie", "", key="enr_outdir")
+        gmt_file = st.file_uploader("GMT (optionnel)", type=["gmt"], key="enr_gmt")
+        gene_sets = None
+        if gmt_file is not None:
+            gene_sets = parse_gmt(gmt_file.getvalue())
+            st.success(f"✅ {len(gene_sets)} gene sets")
+
+        genes_to_enrich = None
+        src_df = {"Gènes SNPs Race": ss.get("sel_ann_race"),
+                  "Gènes SNPs Groupe": ss.get("sel_ann_group"),
+                  "Gènes annotés (sel_ann)": ss.get("sel_ann"),
+                  "Gènes VEP": ss.get("vep_res")}.get(src_g)
+
         if src_g == "Liste manuelle":
             txt = st.text_area("Liste de gènes (1/ligne)", key="enr_manual")
-            if txt.strip(): genes_to_enrich = [g.strip() for g in txt.splitlines() if g.strip()]
-        elif src_df is not None and "GENE" in src_df.columns: genes_to_enrich = src_df["GENE"].dropna().unique().tolist()
-        if genes_to_enrich: genes_to_enrich = [g for g in genes_to_enrich if str(g).strip() not in ("N/A", "Intergenic/Non-codant", "Région régulatrice", "Unknown", "nan", "")]
-        if genes_to_enrich and st.button("🔬 Enrichissement", type="primary", key="enr_btn"):
-            with st.spinner("Enrichissement (orthologues humains)..."): ss.enr_res = run_enrichment(genes_to_enrich, gene_sets=gene_sets, organism="Human", outdir=outdir or None)
-        if ss.enr_res is not None:
-            if ss.enr_res.empty: st.warning("Aucun terme enrichi (≥ 3 gènes requis).")
-            else: st.success(f"✅ {len(ss.enr_res)} termes"); st.dataframe(ss.enr_res.head(30), width='stretch'); st.download_button("⬇ CSV", ss.enr_res.to_csv(index=False).encode(), "enrichment.csv", "text/csv")
+            if txt.strip():
+                genes_to_enrich = [g.strip() for g in txt.splitlines() if g.strip()]
+        elif src_df is not None and "GENE" in src_df.columns:
+            genes_to_enrich = src_df["GENE"].dropna().unique().tolist()
 
-        st.divider(); st.markdown("## 4️⃣ Réseau STRING"); genes_string = []
-        if ss.get("sel_ann") is not None and "GENE" in ss.sel_ann.columns: genes_string = ss.sel_ann["GENE"].dropna().unique().tolist()
-        st.info(f"Gènes disponibles : {len(genes_string)}"); c1, c2 = st.columns(2); score_str = c1.selectbox("Score STRING", [150, 400, 700, 900], index=1, key="string_score"); max_genes = c2.slider("Nb max", 5, 100, 30, key="string_max")
-        if st.button("🕸️ Réseau STRING", type="primary", key="string_btn"):
-            if len(genes_string) < 2: st.warning("Il faut ≥ 2 gènes.")
+        if genes_to_enrich:
+            genes_to_enrich = [g for g in genes_to_enrich if str(g).strip() not in
+                               ("N/A", "Intergenic/Non-codant", "Région régulatrice", "Unknown", "nan", "")]
+
+        if genes_to_enrich and st.button("🔬 Enrichissement", type="primary", key="enr_btn"):
+            with st.spinner("Enrichissement (orthologues humains)..."):
+                ss.enr_res = run_enrichment(genes_to_enrich, gene_sets=gene_sets,
+                                            organism="Human", outdir=outdir or None)
+
+        if ss.enr_res is not None:
+            if ss.enr_res.empty:
+                st.warning("Aucun terme enrichi (≥ 3 gènes requis).")
             else:
-                with st.spinner("STRING..."): ss.string_res = query_string_network(genes_string[:max_genes], species=TAXON, required_score=int(score_str))
+                st.success(f"✅ {len(ss.enr_res)} termes")
+                st.dataframe(ss.enr_res.head(30), width='stretch')
+                st.download_button("⬇ CSV", ss.enr_res.to_csv(index=False).encode(),
+                                   "enrichment.csv", "text/csv")
+
+        # 4. Réseau STRING
+        st.divider()
+        st.markdown("## 4️⃣ Réseau STRING")
+        genes_string = []
+        if ss.get("sel_ann") is not None and "GENE" in ss.sel_ann.columns:
+            genes_string = ss.sel_ann["GENE"].dropna().unique().tolist()
+        st.info(f"Gènes disponibles : {len(genes_string)}")
+        c1, c2 = st.columns(2)
+        score_str = c1.selectbox("Score STRING", [150, 400, 700, 900], index=1, key="string_score")
+        max_genes = c2.slider("Nb max", 5, 100, 30, key="string_max")
+
+        if st.button("🕸️ Réseau STRING", type="primary", key="string_btn"):
+            if len(genes_string) < 2:
+                st.warning("Il faut ≥ 2 gènes.")
+            else:
+                with st.spinner("STRING..."):
+                    ss.string_res = query_string_network(genes_string[:max_genes],
+                                                        species=TAXON, required_score=int(score_str))
+
         if ss.string_res is not None:
             edges, nodes = ss.string_res
-            if edges.empty: st.warning("Aucune interaction (espèce absente de STRING ?).")
+            if edges.empty:
+                st.warning("Aucune interaction (espèce absente de STRING ?).")
             else:
-                st.success(f"✅ {len(edges)} interactions"); fig = plot_string_network(edges, nodes)
-                if fig: st.plotly_chart(fig, width='stretch', key="string_network_plot")
-                st.dataframe(edges, width='stretch'); st.download_button("⬇ CSV", edges.to_csv(index=False).encode(), "string_network.csv", "text/csv")
+                st.success(f"✅ {len(edges)} interactions")
+                fig = plot_string_network(edges, nodes)
+                if fig:
+                    st.plotly_chart(fig, width='stretch', key="string_network_plot")
+                st.dataframe(edges, width='stretch')
+                st.download_button("⬇ CSV", edges.to_csv(index=False).encode(),
+                                   "string_network.csv", "text/csv")
 
-    # ---------------- ML ----------------
+    # ---------------- TAB 15 : ML (Random Forest) ----------------
     with tabs[15]:
         st.subheader("🧠 Random Forest")
-        if ss.gt_filt is not None and ss.get("pheno_df") is not None and len(ss.pheno_df) == len(ss.ind_filt):
+        if (ss.gt_filt is not None and ss.get("pheno_df") is not None
+                and len(ss.pheno_df) == len(ss.ind_filt)):
             cols = [c for c in ss.pheno_df.columns if c not in ("FID", "IID", "Animal")]
             if cols:
-                pc = st.selectbox("Phénotype", cols, key="ml_pc"); nmax = st.number_input("Nb max de SNPs (plus variables d'abord)", 500, 50000, 5000, 500, key="ml_nmax")
+                pc = st.selectbox("Phénotype", cols, key="ml_pc")
+                nmax = st.number_input("Nb max de SNPs (plus variables d'abord)",
+                                       500, 50000, 5000, 500, key="ml_nmax")
                 if st.button("🚀 Entraîner", type="primary", key="ml_btn"):
                     try:
-                        gu, sg, _ = work_data(); ps = pd.to_numeric(ss.pheno_df[pc], errors="coerce"); valid = np.isfinite(ps.values)
-                        if valid.sum() < 20: st.error("❌ Pas assez d'individus.")
+                        gu, sg, _ = work_data()
+                        ps = pd.to_numeric(ss.pheno_df[pc], errors="coerce")
+                        valid = np.isfinite(ps.values)
+                        if valid.sum() < 20:
+                            st.error("❌ Pas assez d'individus.")
                         else:
-                            X = impute_mean(gu[valid]); y = ps.values[valid]; top = np.argsort(-X.var(0))[:int(nmax)]; X = X[:, top]; names = sg["SNP"].values[top]
+                            X = impute_mean(gu[valid]); y = ps.values[valid]
+                            top = np.argsort(-X.var(0))[:int(nmax)]
+                            X = X[:, top]; names = sg["SNP"].values[top]
                             with st.spinner("Random Forest..."):
-                                X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42); rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1).fit(X_tr, y_tr)
-                                ss.rf_res = (float(r2_score(y_te, rf.predict(X_te))), pd.DataFrame({"SNP": names, "Importance": rf.feature_importances_}).sort_values("Importance", ascending=False).head(15))
-                    except Exception as e: st.error(f"❌ {e}")
+                                X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
+                                rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1).fit(X_tr, y_tr)
+                                ss.rf_res = (float(r2_score(y_te, rf.predict(X_te))),
+                                             pd.DataFrame({"SNP": names, "Importance": rf.feature_importances_})
+                                             .sort_values("Importance", ascending=False).head(15))
+                    except Exception as e:
+                        st.error(f"❌ {e}")
                 if ss.rf_res is not None:
-                    r2_rf, df_imp = ss.rf_res; st.success(f"✅ R² (RF, test 20 %) = {r2_rf:.3f}"); st.info("💡 Comparez avec le r² de validation croisée du GBLUP (métriques différentes : à interpréter avec prudence).")
-                    fig = px.bar(df_imp, x="Importance", y="SNP", orientation="h", title="Top 15 SNPs"); fig.update_layout(yaxis={"categoryorder": "total ascending"}); st.plotly_chart(fig, width='stretch', key="plot_rf")
-        else: st.warning("⚠️ Chargez données + phénotypes.")
+                    r2_rf, df_imp = ss.rf_res
+                    st.success(f"✅ R² (RF, test 20 %) = {r2_rf:.3f}")
+                    st.info("💡 Comparez avec r² de validation croisée du GBLUP.")
+                    fig = px.bar(df_imp, x="Importance", y="SNP", orientation="h", title="Top 15 SNPs")
+                    fig.update_layout(yaxis={"categoryorder": "total ascending"})
+                    st.plotly_chart(fig, width='stretch', key="plot_rf")
+        else:
+            st.warning("⚠️ Chargez données + phénotypes.")
 
-    # ---------------- Génotypes / blocs ----------------
+    # ---------------- TAB 16 : Génotypes / blocs ----------------
     with tabs[16]:
         st.subheader("🧬 Carte des génotypes par chromosome")
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
-            gu, su, iu = work_data(); chroms = sorted(su["CHR"].astype(str).unique(), key=_chk); sel_chr = st.selectbox("Chromosome", chroms, key="hap_chr"); sub_idx = su[su["CHR"].astype(str) == sel_chr].sort_values("BP").index
+            gu, su, iu = work_data()
+            chroms = sorted(su["CHR"].astype(str).unique(), key=_chk)
+            sel_chr = st.selectbox("Chromosome", chroms, key="hap_chr")
+            sub_idx = su[su["CHR"].astype(str) == sel_chr].sort_values("BP").index
             if len(sub_idx) > 0:
-                sub_idx = sub_idx[:50]; groups = iu["FID"].astype(str).values; order = np.argsort(groups, kind="stable")
-                fig = px.imshow(gu[:, sub_idx][order], labels=dict(x="SNPs (ordre physique)", y="Individus", color="Génotype"), x=su.loc[sub_idx, "SNP"].values, y=groups[order], color_continuous_scale=["#F0F0F0", "#3498db", "#e74c3c"], title=f"Génotypes CHR{sel_chr} (50 premiers SNPs)", aspect="auto")
-                st.plotly_chart(fig, width='stretch', key="plot_hap"); st.caption("🖱️ Génotypes NON phasés (0/1/2 copies de l'allèle minoritaire) : ce n'est pas une inférence de haplotypes.")
-            else: st.warning("Aucun SNP sur ce chromosome.")
+                sub_idx = sub_idx[:50]
+                groups = iu["FID"].astype(str).values
+                order = np.argsort(groups, kind="stable")
+                fig = px.imshow(gu[:, sub_idx][order],
+                                labels=dict(x="SNPs (ordre physique)", y="Individus", color="Génotype"),
+                                x=su.loc[sub_idx, "SNP"].values, y=groups[order],
+                                color_continuous_scale=["#F0F0F0", "#3498db", "#e74c3c"],
+                                title=f"Génotypes CHR{sel_chr} (50 premiers SNPs)", aspect="auto")
+                st.plotly_chart(fig, width='stretch', key="plot_hap")
+                st.caption("🖱️ Génotypes NON phasés (0/1/2 copies de l'allèle minoritaire).")
+            else:
+                st.warning("Aucun SNP sur ce chromosome.")
 
-    # ---------------- Orthologue ----------------
+    # ---------------- TAB 17 : Orthologue humain ----------------
     with tabs[17]:
         st.subheader("🌍 Gène chevauchant → orthologue humain (Ensembl Compara)")
         if ss.get("snp_filt") is not None:
-            su = ss.snp_pruned if ss.snp_pruned is not None else ss.snp_filt; target_snp = st.selectbox("SNP à convertir", su["SNP"].tolist(), key="lift_snp")
+            su = ss.snp_pruned if ss.snp_pruned is not None else ss.snp_filt
+            target_snp = st.selectbox("SNP à convertir", su["SNP"].tolist(), key="lift_snp")
             if st.button("🔄 Chercher", type="primary", key="lift_btn"):
                 row = su[su["SNP"] == target_snp].iloc[0]
-                with st.spinner(f"Recherche pour {row['CHR']}:{int(row['BP'])}..."): ss.lift_res = ortholog_lookup(str(row["CHR"]), int(row["BP"]), VEP_SPECIES)
-                if ss.lift_res is None: st.error("❌ Aucun gène (±50 kb) ou erreur réseau.")
+                with st.spinner(f"Recherche pour {row['CHR']}:{int(row['BP'])}..."):
+                    ss.lift_res = ortholog_lookup(str(row["CHR"]), int(row["BP"]), VEP_SPECIES)
+                if ss.lift_res is None:
+                    st.error("❌ Aucun gène (±50 kb) ou erreur réseau.")
+
             res = ss.get("lift_res")
             if res:
-                if not res.get("human_gene"): st.warning(f"Gène {res['gene_src']} trouvé, mais sans orthologue humain.")
-                else: st.success(f"✅ {res['gene_src']} → **{res['human_gene']}** (humain, chr{res['chr']}:{res['start']}-{res['end']}, {res.get('assembly', '')}, identité {res.get('perc_id', 'N/A')} %)"); st.info("💡 Interroger le GWAS Catalog pour ce gène humain.")
-        else: st.warning("Chargez des données.")
+                if not res.get("human_gene"):
+                    st.warning(f"Gène {res['gene_src']} trouvé, mais sans orthologue humain.")
+                else:
+                    st.success(f"✅ {res['gene_src']} → **{res['human_gene']}** "
+                               f"(humain, chr{res['chr']}:{res['start']}-{res['end']}, "
+                               f"{res.get('assembly', '')}, identité {res.get('perc_id', 'N/A')} %)")
+                    st.info("💡 Interroger le GWAS Catalog pour ce gène humain.")
+        else:
+            st.warning("Chargez des données.")
 
-    # ---------------- Stats publication ----------------
+    # ---------------- TAB 18 : Stats publication ----------------
     with tabs[18]:
         st.subheader("📐 Statistiques pour publication")
-        if ss.gt_filt is None: st.info(NEED_QC)
+        if ss.gt_filt is None:
+            st.info(NEED_QC)
         else:
-            gf, sf, inf = ss.gt_filt, ss.snp_filt, ss.ind_filt; lab_all = inf["FID"].astype(str).values; gp_, sp_, ip_ = work_data(); lab_p = ip_["FID"].astype(str).values
-            c1, c2 = st.columns(2); min_n = c1.number_input("N min par population", 3, 50, 5, key="pub_minn"); hwe_thr = c2.number_input("Seuil HWE par population", value=float(hwe_t), min_value=0.0, max_value=1.0, step=1e-6, format="%.0e", key="pub_hwe")
-            st.caption("Diversité, allèles privés et HWE : tous les SNPs filtrés QC. FST, Fis/Fst/Fit, AMOVA, Mantel : SNPs élagués LD si disponibles (loci plus indépendants).")
+            gf, sf, inf = ss.gt_filt, ss.snp_filt, ss.ind_filt
+            lab_all = inf["FID"].astype(str).values
+            gp_, sp_, ip_ = work_data()
+            lab_p = ip_["FID"].astype(str).values
 
+            c1, c2 = st.columns(2)
+            min_n = c1.number_input("N min par population", 3, 50, 5, key="pub_minn")
+            hwe_thr = c2.number_input("Seuil HWE par population",
+                                      value=float(hwe_t), min_value=0.0, max_value=1.0,
+                                      step=1e-6, format="%.0e", key="pub_hwe")
+            st.caption("Diversité/allèles privés/HWE : tous les SNPs QC. "
+                       "FST/Fis/Fit/AMOVA/Mantel : SNPs élagués LD si disponibles.")
+
+            # 1. Tableau de diversité complet
             st.markdown("### 1️⃣ Tableau de diversité complet par population")
             if st.button("▶ Calculer le tableau complet", key="pub_div_btn", type="primary"):
                 try:
-                    with st.spinner("Ho/He/Fis, Na/Ae/Ar, π, θ_W, Shannon, allèles privés, HWE par population (peut prendre quelques minutes)..."):
-                        base = compute_diversity(gf, lab_all); ext, g_used = diversity_extended(gf, lab_all, int(min_n)); priv = private_alleles(gf, lab_all, int(min_n)); pvd = hwe_by_pop(gf, lab_all, int(min_n))
-                        hw = pd.DataFrame({"Population": pvd.columns, "SNPs testés (HWE)": pvd.notna().sum().values, "SNPs HWE<seuil": (pvd < hwe_thr).sum().values}); hw["% HWE<seuil"] = (100 * hw["SNPs HWE<seuil"] / hw["SNPs testés (HWE)"].clip(lower=1)).round(2)
-                        tbl = base.merge(ext.drop(columns=["N"]), on="Population").merge(priv.drop(columns=["N"]), on="Population").merge(hw, on="Population")
+                    with st.spinner("Ho/He/Fis, Na/Ae/Ar, π, θ_W, Shannon, allèles privés, HWE..."):
+                        base = compute_diversity(gf, lab_all)
+                        ext, g_used = diversity_extended(gf, lab_all, int(min_n))
+                        priv = private_alleles(gf, lab_all, int(min_n))
+                        pvd = hwe_by_pop(gf, lab_all, int(min_n))
+                        hw = pd.DataFrame({
+                            "Population": pvd.columns,
+                            "SNPs testés (HWE)": pvd.notna().sum().values,
+                            "SNPs HWE<seuil": (pvd < hwe_thr).sum().values,
+                        })
+                        hw["% HWE<seuil"] = (100 * hw["SNPs HWE<seuil"] /
+                                             hw["SNPs testés (HWE)"].clip(lower=1)).round(2)
+                        tbl = (base.merge(ext.drop(columns=["N"]), on="Population")
+                                    .merge(priv.drop(columns=["N"]), on="Population")
+                                    .merge(hw, on="Population"))
                     ss.pub_div = (tbl, g_used)
-                except Exception as e: st.error(f"❌ {e}")
-            if ss.get("pub_div") is not None:
-                tbl, g_used = ss.pub_div; st.dataframe(tbl, width='stretch'); st.download_button("⬇ Tableau 1 (CSV)", tbl.to_csv(index=False).encode(), "tableau_diversite_complet.csv", "text/csv")
-                st.caption(f"Ar : raréfaction à g = {g_used} gènes (même taille d'échantillon pour toutes les races). π et θ_W : par SNP typé, sans correction par la longueur : sur puce SNP (biais d'ascertainment), comparer les races entre elles, pas à des valeurs par pb de la littérature. Les allèles privés dépendent de la taille d'échantillon : à interpréter avec Ar.")
+                except Exception as e:
+                    st.error(f"❌ {e}")
 
-            st.divider(); st.markdown("### 2️⃣ FST pairwise : p-values par permutation et IC95 %")
-            c1, c2 = st.columns(2); nperm = c1.slider("Permutations", 100, 2000, 1000, 100, key="pub_nperm"); nboot = c2.slider("Bootstrap loci (IC)", 100, 2000, 1000, 100, key="pub_nboot")
+            if ss.get("pub_div") is not None:
+                tbl, g_used = ss.pub_div
+                st.dataframe(tbl, width='stretch')
+                st.download_button("⬇ Tableau 1 (CSV)",
+                                   tbl.to_csv(index=False).encode(),
+                                   "tableau_diversite_complet.csv", "text/csv")
+                st.caption(f"Ar : raréfaction à g = {g_used}. π et θ_W : par SNP typé, "
+                           "sans correction par longueur.")
+
+            # 2. FST pairwise avec permutations
+            st.divider()
+            st.markdown("### 2️⃣ FST pairwise : p-values par permutation et IC95 %")
+            c1, c2 = st.columns(2)
+            nperm = c1.slider("Permutations", 100, 2000, 1000, 100, key="pub_nperm")
+            nboot = c2.slider("Bootstrap loci (IC)", 100, 2000, 1000, 100, key="pub_nboot")
+
             if st.button("▶ Lancer FST pairwise + permutations", key="pub_fst_btn", type="primary"):
                 try:
-                    with st.spinner(f"{nperm} permutations par paire..."): ss.fst_perm = fst_pairwise_perm(gp_, lab_p, int(nperm), 42, int(nboot))
-                except Exception as e: st.error(f"❌ {e}")
+                    with st.spinner(f"{nperm} permutations par paire..."):
+                        ss.fst_perm = fst_pairwise_perm(gp_, lab_p, int(nperm), 42, int(nboot))
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
             if ss.get("fst_perm") is not None:
                 fp = ss.fst_perm
-                if fp.empty: st.warning("Aucune paire exploitable (≥ 2 individus par population).")
+                if fp.empty:
+                    st.warning("Aucune paire exploitable (≥ 2 individus par population).")
                 else:
-                    st.dataframe(fp, width='stretch'); st.download_button("⬇ FST pairwise (CSV)", fp.to_csv(index=False).encode(), "fst_pairwise_perm.csv", "text/csv")
-                    pops_ = sorted(set(fp["Pop1"]) | set(fp["Pop2"])); Mx = pd.DataFrame(np.nan, index=pops_, columns=pops_)
-                    for _, r in fp.iterrows(): Mx.loc[r["Pop1"], r["Pop2"]] = r["FST"]; Mx.loc[r["Pop2"], r["Pop1"]] = r["FST"]
-                    st.plotly_chart(px.imshow(Mx, text_auto=".3f", color_continuous_scale="Viridis", title="FST pairwise (W&C 1984)"), width='stretch', key="plot_pub_fst")
-                    st.caption(f"p minimale atteignable = 1/({int(nperm)}+1). Corrections : Bonferroni et Benjamini-Hochberg sur l'ensemble des {len(fp)} paires.")
+                    st.dataframe(fp, width='stretch')
+                    st.download_button("⬇ FST pairwise (CSV)",
+                                       fp.to_csv(index=False).encode(),
+                                       "fst_pairwise_perm.csv", "text/csv")
+                    pops_ = sorted(set(fp["Pop1"]) | set(fp["Pop2"]))
+                    Mx = pd.DataFrame(np.nan, index=pops_, columns=pops_)
+                    for _, r in fp.iterrows():
+                        Mx.loc[r["Pop1"], r["Pop2"]] = r["FST"]
+                        Mx.loc[r["Pop2"], r["Pop1"]] = r["FST"]
+                    st.plotly_chart(px.imshow(Mx, text_auto=".3f",
+                                              color_continuous_scale="Viridis",
+                                              title="FST pairwise (W&C 1984)"),
+                                    width='stretch', key="plot_pub_fst")
+                    st.caption(f"p minimale = 1/({int(nperm)}+1). "
+                               "Corrections Bonferroni et Benjamini-Hochberg incluses.")
 
-            st.divider(); st.markdown("### 3️⃣ Fis / Fst / Fit de Weir & Cockerham par locus")
+            # 3. Fis / Fst / Fit
+            st.divider()
+            st.markdown("### 3️⃣ Fis / Fst / Fit de Weir & Cockerham par locus")
             if st.button("▶ Calculer Fis / Fst / Fit", key="pub_f_btn", type="primary"):
                 try:
-                    with st.spinner("W&C + bootstrap..."): ss.fstats = wc_fstats(gp_, lab_p, 1000)
-                except Exception as e: st.error(f"❌ {e}")
+                    with st.spinner("W&C + bootstrap..."):
+                        ss.fstats = wc_fstats(gp_, lab_p, 1000)
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
             if ss.get("fstats") is not None:
                 arr, gl = ss.fstats
-                if not gl: st.warning("Pas assez de loci valides (≥ 2 populations avec ≥ 2 individus).")
+                if not gl:
+                    st.warning("Pas assez de loci valides.")
                 else:
                     c1, c2, c3 = st.columns(3)
-                    for col, k in ((c1, "Fis"), (c2, "Fst"), (c3, "Fit")): col.metric(k, f"{gl[k]:.4f}", delta=f"IC95 [{gl[k + '_CI'][0]:.4f} ; {gl[k + '_CI'][1]:.4f}]", delta_color="off")
-                    n_ = min(len(sp_), len(arr["FST"])); dl = pd.DataFrame({"SNP": sp_["SNP"].values[:n_], "CHR": sp_["CHR"].astype(str).values[:n_], "BP": sp_["BP"].values[:n_], "FIS": arr["FIS"][:n_], "FST": arr["FST"][:n_], "FIT": arr["FIT"][:n_]})
-                    st.caption(f"{gl['n_loci']} loci · globaux = rapport des sommes · IC par bootstrap des loci (1000) · 1−Fit = (1−Fis)(1−Fst)")
-                    st.plotly_chart(px.histogram(dl.dropna(subset=["FST"]), x="FST", nbins=60, title="Distribution des FST par locus"), width='stretch', key="plot_pub_fsth")
-                    st.plotly_chart(plot_manhattan(dl.dropna(subset=["FST"]), yc="FST", title="FST par locus"), width='stretch', key="plot_pub_fstm"); st.download_button("⬇ Fis/Fst/Fit par locus (CSV)", dl.to_csv(index=False).encode(), "fis_fst_fit_par_locus.csv", "text/csv")
+                    for col, k in ((c1, "Fis"), (c2, "Fst"), (c3, "Fit")):
+                        col.metric(k, f"{gl[k]:.4f}",
+                                   delta=f"IC95 [{gl[k + '_CI'][0]:.4f} ; {gl[k + '_CI'][1]:.4f}]",
+                                   delta_color="off")
+                    n_ = min(len(sp_), len(arr["FST"]))
+                    dl = pd.DataFrame({
+                        "SNP": sp_["SNP"].values[:n_],
+                        "CHR": sp_["CHR"].astype(str).values[:n_],
+                        "BP": sp_["BP"].values[:n_],
+                        "FIS": arr["FIS"][:n_],
+                        "FST": arr["FST"][:n_],
+                        "FIT": arr["FIT"][:n_],
+                    })
+                    st.caption(f"{gl['n_loci']} loci · globaux = rapport des sommes · IC par bootstrap (1000)")
+                    st.plotly_chart(px.histogram(dl.dropna(subset=["FST"]), x="FST", nbins=60,
+                                                 title="Distribution des FST par locus"),
+                                    width='stretch', key="plot_pub_fsth")
+                    st.plotly_chart(plot_manhattan(dl.dropna(subset=["FST"]), yc="FST",
+                                                   title="FST par locus"),
+                                    width='stretch', key="plot_pub_fstm")
+                    st.download_button("⬇ Fis/Fst/Fit par locus (CSV)",
+                                       dl.to_csv(index=False).encode(),
+                                       "fis_fst_fit_par_locus.csv", "text/csv")
 
-            st.divider(); st.markdown("### 4️⃣ AMOVA hiérarchique (groupes › races › individus)")
-            c1, c2 = st.columns(2); crit = c1.selectbox("Critère de groupes", list(GROUPES_DEFAULT.keys()), key="pub_amova_crit"); nperm_a = c2.slider("Permutations", 99, 999, 999, 100, key="pub_amova_perm")
+            # 4. AMOVA
+            st.divider()
+            st.markdown("### 4️⃣ AMOVA hiérarchique (groupes › races › individus)")
+            c1, c2 = st.columns(2)
+            crit = c1.selectbox("Critère de groupes", list(GROUPES_DEFAULT.keys()), key="pub_amova_crit")
+            nperm_a = c2.slider("Permutations", 99, 999, 999, 100, key="pub_amova_perm")
+
             if st.button("▶ Lancer l'AMOVA", key="pub_amova_btn", type="primary"):
                 try:
-                    ig = apply_group_mapping(ip_, make_group_map(GROUPES_DEFAULT[crit])); keep = (ig["FID_GROUPE"] != "AUTRE").values
-                    if keep.sum() < 10: raise ValueError("Moins de 10 individus appartiennent aux groupes du critère")
-                    with st.spinner("AMOVA + permutations..."): ss.amova_res = amova(gp_[keep], ig["FID"].values[keep], ig["FID_GROUPE"].values[keep], int(nperm_a))
+                    ig = apply_group_mapping(ip_, make_group_map(GROUPES_DEFAULT[crit]))
+                    keep = (ig["FID_GROUPE"] != "AUTRE").values
+                    if keep.sum() < 10:
+                        raise ValueError("Moins de 10 individus appartiennent aux groupes du critère")
+                    with st.spinner("AMOVA + permutations..."):
+                        ss.amova_res = amova(gp_[keep], ig["FID"].values[keep],
+                                             ig["FID_GROUPE"].values[keep], int(nperm_a))
                     ss.amova_crit = crit
-                except Exception as e: st.error(f"❌ {e}")
-            if ss.get("amova_res") is not None:
-                a = ss.amova_res; st.dataframe(a["table"], width='stretch'); p = a["p"]; c1, c2, c3 = st.columns(3)
-                c1.metric("ΦCT (entre groupes)", f"{a['PhiCT']:.4f}", delta=f"p = {p['PhiCT']:.4f}", delta_color="off"); c2.metric("ΦSC (races dans groupes)", f"{a['PhiSC']:.4f}", delta=f"p = {p['PhiSC']:.4f}", delta_color="off"); c3.metric("ΦST (total)", f"{a['PhiST']:.4f}", delta=f"p = {p['PhiST']:.4f}", delta_color="off")
-                st.caption(f"{a['n_groups']} groupes, {a['n_pops']} races, {a['n_perm']} permutations. Avec peu de races, le nombre de permutations distinctes de ΦCT est très limité (p minimale élevée). Distances euclidiennes² de génotypes (manquants imputés par la moyenne).")
-                st.download_button("⬇ Tableau AMOVA (CSV)", a["table"].to_csv(index=False).encode(), "amova.csv", "text/csv")
+                except Exception as e:
+                    st.error(f"❌ {e}")
 
-            st.divider(); st.markdown("### 5️⃣ Isolement par la distance (IBD) + test de Mantel")
-            cf = st.file_uploader("CSV coordonnées GPS par race (colonnes RACE, LAT, LON)", type=["csv"], key="pub_coords")
-            c1, c2 = st.columns(2); tr_ = c1.radio("Distance géographique", ["ln(km)", "km"], horizontal=True, key="pub_ibd_tr"); nperm_m = c2.slider("Permutations Mantel", 99, 9999, 999, 100, key="pub_mantel_perm")
+            if ss.get("amova_res") is not None:
+                a = ss.amova_res
+                st.dataframe(a["table"], width='stretch')
+                p = a["p"]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("ΦCT (entre groupes)", f"{a['PhiCT']:.4f}",
+                          delta=f"p = {p['PhiCT']:.4f}", delta_color="off")
+                c2.metric("ΦSC (races dans groupes)", f"{a['PhiSC']:.4f}",
+                          delta=f"p = {p['PhiSC']:.4f}", delta_color="off")
+                c3.metric("ΦST (total)", f"{a['PhiST']:.4f}",
+                          delta=f"p = {p['PhiST']:.4f}", delta_color="off")
+                st.caption(f"{a['n_groups']} groupes, {a['n_pops']} races, "
+                           f"{a['n_perm']} permutations.")
+                st.download_button("⬇ Tableau AMOVA (CSV)",
+                                   a["table"].to_csv(index=False).encode(),
+                                   "amova.csv", "text/csv")
+
+            # 5. IBD / Mantel
+            st.divider()
+            st.markdown("### 5️⃣ Isolement par la distance (IBD) + test de Mantel")
+            cf = st.file_uploader("CSV coordonnées GPS (RACE, LAT, LON)", type=["csv"], key="pub_coords")
+            c1, c2 = st.columns(2)
+            tr_ = c1.radio("Distance géographique", ["ln(km)", "km"], horizontal=True, key="pub_ibd_tr")
+            nperm_m = c2.slider("Permutations Mantel", 99, 9999, 999, 100, key="pub_mantel_perm")
+
             if cf is not None and st.button("▶ Lancer IBD / Mantel", key="pub_mantel_btn", type="primary"):
                 try:
-                    co = pd.read_csv(io.BytesIO(cf.getvalue())); co["RACE"] = co["RACE"].astype(str).str.upper(); M, pops_m = fst_pairwise(gp_, lab_p, True); idx_m = {p.upper(): i for i, p in enumerate(pops_m)}
+                    co = pd.read_csv(io.BytesIO(cf.getvalue()))
+                    co["RACE"] = co["RACE"].astype(str).str.upper()
+                    M, pops_m = fst_pairwise(gp_, lab_p, True)
+                    idx_m = {p.upper(): i for i, p in enumerate(pops_m)}
                     co = co[co["RACE"].isin(idx_m)].drop_duplicates("RACE")
-                    if len(co) < 4: raise ValueError("Au moins 4 races avec coordonnées sont nécessaires")
-                    ii = [idx_m[r] for r in co["RACE"]]; Fm = np.clip(M[np.ix_(ii, ii)], 0, 0.999); Gd = Fm / (1 - Fm); km = haversine_matrix(co["LAT"], co["LON"]); Xd = np.log(km + 1.0) if tr_ == "ln(km)" else km
-                    r_, p_ = mantel_test(Gd, Xd, int(nperm_m)); iu = np.triu_indices(len(co), 1); ss.mantel_res = {"r": r_, "p": p_, "x": Xd[iu], "y": Gd[iu], "n": len(co), "lab": tr_}
-                except Exception as e: st.error(f"❌ {e}")
+                    if len(co) < 4:
+                        raise ValueError("Au moins 4 races avec coordonnées sont nécessaires")
+                    ii = [idx_m[r] for r in co["RACE"]]
+                    Fm = np.clip(M[np.ix_(ii, ii)], 0, 0.999)
+                    Gd = Fm / (1 - Fm)
+                    km = haversine_matrix(co["LAT"], co["LON"])
+                    Xd = np.log(km + 1.0) if tr_ == "ln(km)" else km
+                    r_, p_ = mantel_test(Gd, Xd, int(nperm_m))
+                    iu = np.triu_indices(len(co), 1)
+                    ss.mantel_res = {"r": r_, "p": p_, "x": Xd[iu], "y": Gd[iu],
+                                     "n": len(co), "lab": tr_}
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
             if ss.get("mantel_res") is not None:
-                m = ss.mantel_res; st.metric("Corrélation de Mantel (r)", f"{m['r']:.4f}", delta=f"p = {m['p']:.4f} (unilatéral) · {m['n']} races", delta_color="off")
-                fg = px.scatter(x=m["x"], y=m["y"], labels={"x": f"Distance géographique ({m['lab']})", "y": "FST/(1−FST)"}, title="Isolement par la distance")
-                if len(m["x"]) > 1: z = np.polyfit(m["x"], m["y"], 1); xs = np.linspace(m["x"].min(), m["x"].max(), 50); fg.add_trace(go.Scatter(x=xs, y=np.poly1d(z)(xs), mode="lines", name="régression", line=dict(color="red", dash="dash")))
+                m = ss.mantel_res
+                st.metric("Corrélation de Mantel (r)", f"{m['r']:.4f}",
+                          delta=f"p = {m['p']:.4f} (unilatéral) · {m['n']} races",
+                          delta_color="off")
+                fg = px.scatter(x=m["x"], y=m["y"],
+                                labels={"x": f"Distance géographique ({m['lab']})",
+                                        "y": "FST/(1−FST)"},
+                                title="Isolement par la distance")
+                if len(m["x"]) > 1:
+                    z = np.polyfit(m["x"], m["y"], 1)
+                    xs = np.linspace(m["x"].min(), m["x"].max(), 50)
+                    fg.add_trace(go.Scatter(x=xs, y=np.poly1d(z)(xs), mode="lines",
+                                            name="régression",
+                                            line=dict(color="red", dash="dash")))
                 st.plotly_chart(fg, width='stretch', key="plot_pub_ibd")
 
+
+# ============================================================
+# POINT D'ENTRÉE
+# ============================================================
 if __name__ == "__main__":
     main()
